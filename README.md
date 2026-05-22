@@ -188,3 +188,17 @@ The script requires specific permissions to list objects, upload files, copy obj
 8. Select **Command Line Interface (CLI)**, acknowledge the warning, and proceed.
 9. **CRITICAL:** Copy the **Access key ID** and **Secret access key**. This is the only time you can view the Secret Key.
 10. Open your Windows Server/Machine and run `aws configure` (as shown in Step 2 of the main Setup Guide) using these newly generated keys.
+
+
+## License
+
+© 2026 TH-Project-Files. 
+
+This project is licensed under the **Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)** License. 
+
+**What this means:**
+* **Anyone can use it:** You are free to copy, redistribute, remix, and build upon this framework.
+* **Attribute the author:** You must give appropriate credit, provide a link to the license, and indicate if changes were made.
+* **No commercial use:** You may not use this material, or derivatives of it, for commercial purposes or monetization.
+
+For the full legal terms, please review the [LICENSE.md](LICENSE.md) file included in this repository.
