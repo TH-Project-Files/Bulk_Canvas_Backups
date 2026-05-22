@@ -139,7 +139,7 @@ To run this script securely, you need an S3 bucket configured for private access
 ### 1. Create the S3 Bucket
 1. Log in to the AWS Management Console and navigate to **S3**.
 2. Click **Create bucket**.
-3. **Bucket name:** Choose a globally unique name (e.g., `school-canvas-backups-2026`).
+3. **Bucket name:** Choose a globally unique name (e.g., `school-canvas-backups`).
 4. **AWS Region:** Select your preferred region (e.g., `us-east-1`).
 5. **Block Public Access settings:** Ensure **Block *all* public access** is checked (Critical for FERPA).
 6. **Bucket Versioning:** Leave *Disabled*. (The script natively handles versioning via tiered folders; enabling AWS versioning will result in hidden storage costs when the script automatically prunes older backups).
