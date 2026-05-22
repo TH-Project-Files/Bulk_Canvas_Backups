@@ -139,7 +139,7 @@ To run this script securely, you need an S3 bucket configured for private access
 ### 1. Create the S3 Bucket
 1. Log in to the AWS Management Console and navigate to **S3**.
 2. Click **Create bucket**.
-3. **Bucket name:** Choose a globally unique name (e.g., `school-canvas-backups`).
+3. **Bucket name:** Choose a globally unique name (e.g., `school-canvas-backups-2026`).
 4. **AWS Region:** Select your preferred region (e.g., `us-east-1`).
 5. **Block Public Access settings:** Ensure **Block *all* public access** is checked (Critical for FERPA).
 6. **Bucket Versioning:** Leave *Disabled*. (The script natively handles versioning via tiered folders; enabling AWS versioning will result in hidden storage costs when the script automatically prunes older backups).
@@ -188,7 +188,6 @@ The script requires specific permissions to list objects, upload files, copy obj
 8. Select **Command Line Interface (CLI)**, acknowledge the warning, and proceed.
 9. **CRITICAL:** Copy the **Access key ID** and **Secret access key**. This is the only time you can view the Secret Key.
 10. Open your Windows Server/Machine and run `aws configure` (as shown in Step 2 of the main Setup Guide) using these newly generated keys.
-
 
 ## License
 
