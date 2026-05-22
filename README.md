@@ -69,18 +69,22 @@ Write-Host "Encrypted config written to $configPath"
 ```
 
 ### 5. Schedule via Windows Task Scheduler
-Run the following in an elevated PowerShell prompt to register the nightly job:
+**Critical Requirement:** Because the `canvas-backup-config.clixml` file is encrypted using Windows DPAPI, the scheduled task **must** execute under the exact same Windows user account that generated the file in Step 4. If a different user (or the SYSTEM account) attempts to run the script, it will fail to decrypt the Canvas API token.
+
+Run the following in an elevated PowerShell prompt to register the nightly job. You will be prompted to enter the password for the executing user account:
 
 ```powershell
 $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NonInteractive -File "C:\Scripts\Invoke-CanvasNightlyBackup.ps1"'
 $trigger = New-ScheduledTaskTrigger -Daily -At '3:00AM'
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 4)
+$runAsUser = $env:USERNAME # Ensure this is the same user from Step 4
 
 Register-ScheduledTask -TaskName 'Canvas Nightly Backup' `
     -Action $action `
     -Trigger $trigger `
     -Settings $settings `
     -RunLevel Highest `
+    -User $runAsUser `
     -Force
 ```
 
@@ -125,3 +129,62 @@ Logs are written to `C:\Scripts\Logs\` and temporary processing data to `C:\Scri
 * **Ephemeral Data:** Export packages and CSVs containing student data are built in `C:\Scripts\Temp\` and forcefully removed after use.
 * **No Public S3 Access:** Ensure your S3 bucket blocks public access.
 * **Encrypted Config:** `canvas-backup-config.clixml` should never be committed to source control.
+
+---
+
+## 📝 Appendix: S3 Bucket & IAM Setup Guide
+
+To run this script securely, you need an S3 bucket configured for private access and an IAM user with least-privilege permissions.
+
+### 1. Create the S3 Bucket
+1. Log in to the AWS Management Console and navigate to **S3**.
+2. Click **Create bucket**.
+3. **Bucket name:** Choose a globally unique name (e.g., `school-canvas-backups-2026`).
+4. **AWS Region:** Select your preferred region (e.g., `us-east-1`).
+5. **Block Public Access settings:** Ensure **Block *all* public access** is checked (Critical for FERPA).
+6. **Bucket Versioning:** Leave *Disabled*. (The script natively handles versioning via tiered folders; enabling AWS versioning will result in hidden storage costs when the script automatically prunes older backups).
+7. **Default encryption:** Ensure Server-side encryption is enabled (Amazon S3 managed keys - SSE-S3 is sufficient).
+8. Click **Create bucket**.
+
+### 2. Create the Least-Privilege IAM Policy
+The script requires specific permissions to list objects, upload files, copy objects (for tier promotion), and delete objects (for pruning).
+
+1. Navigate to **IAM** > **Policies** and click **Create policy**.
+2. Switch to the **JSON** tab and paste the following policy. Replace `YOUR_BUCKET_NAME` with the bucket name you created in Step 1.
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:ListBucket"
+            ],
+            "Resource": "arn:aws:s3:::YOUR_BUCKET_NAME"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:PutObject",
+                "s3:GetObject",
+                "s3:DeleteObject"
+            ],
+            "Resource": "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+        }
+    ]
+}
+```
+3. Click **Next**, name the policy (e.g., `CanvasBackupS3Access`), and click **Create policy**.
+
+### 3. Create the IAM Service Account & Access Keys
+1. Navigate to **IAM** > **Users** and click **Create user**.
+2. **User name:** Enter a descriptive name (e.g., `svc-canvas-backup`). Click Next.
+3. Under Permissions, select **Attach policies directly**.
+4. Search for and select the `CanvasBackupS3Access` policy you just created. Click Next, then **Create user**.
+5. Once created, click on the user's name to view their profile.
+6. Go to the **Security credentials** tab.
+7. Scroll down to **Access keys** and click **Create access key**.
+8. Select **Command Line Interface (CLI)**, acknowledge the warning, and proceed.
+9. **CRITICAL:** Copy the **Access key ID** and **Secret access key**. This is the only time you can view the Secret Key.
+10. Open your Windows Server/Machine and run `aws configure` (as shown in Step 2 of the main Setup Guide) using these newly generated keys.
