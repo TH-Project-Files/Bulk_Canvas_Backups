@@ -5,26 +5,51 @@
 
 .DESCRIPTION
     This script performs a nightly backup workflow for Canvas content and gradebooks.
+    Uses extensive parallel background jobs to achieve maximum throughput.
 
     High-level flow:
       1. Load encrypted configuration from C:\Scripts\canvas-backup-config.clixml
       2. Resolve terms and enumerate active courses
       3. Bulk-cache today's existing S3 backups to memory (High-Speed Deduplication)
-      4. Back up course content packages (.imscc) - (5 Parallel Background Jobs x 5 Courses = 25 Concurrent)
-      5. Back up course Pages (JSON with HTML body)
-      6. Back up course Files (.zip archive of raw files for tiered retention)
-      7. Back up gradebook CSVs
+      4. Back up course content packages (.imscc) - (5 Parallel Background Jobs)
+      5. Back up course Pages (JSON with HTML body) - (3 Parallel Background Jobs)
+      6. Back up course Files (.zip archive of raw files) - (3 Parallel Background Jobs)
+      7. Back up gradebook CSVs - (3 Parallel Background Jobs)
       8. Optionally recurse through all Canvas sub-accounts for persistent backups
       9. Verify S3 coverage and upload run logs
+
+    Configuration Setup (Run Once):
+      Run the following block manually in PowerShell as the SAME Windows user 
+      account that will run the scheduled task. This creates the encrypted 
+      credentials file at C:\Scripts\canvas-backup-config.clixml:
+      
+      $configPath = 'C:\Scripts\canvas-backup-config.clixml'
+      $config = [pscustomobject]@{
+          CanvasBaseUrl   = Read-Host 'Canvas Base URL'
+          S3Bucket        = Read-Host 'S3 Bucket'
+          AwsRegion       = Read-Host 'AWS Region'
+          RootAccountId   = Read-Host 'Root Account ID (Default is 1)'
+          CanvasApiToken  = Read-Host 'Canvas API Token' -AsSecureString
+      }
+      $config | Export-Clixml -Path $configPath
+
+    Configure AWS Authentication & Optimization (Run Once):
+      Ensure the Windows user account running the script is authenticated to AWS, 
+      and configure the concurrency settings to support the script's parallel background jobs.
+      Run this in your terminal:
+
+      aws configure set aws_access_key_id YOUR_KEY
+      aws configure set aws_secret_access_key YOUR_SECRET
+      aws configure set default.region us-east-1
+      aws configure set default.output json
+      # Required for parallel pushes:
+      aws configure set default.s3.max_concurrent_requests 50
+      aws configure set default.s3.max_queue_size 10000
 
     Hard dependencies:
       - PowerShell 5.1+ (ships with Windows; no install needed)
       - AWS CLI v2 (aws.exe)
       - Network access to the Canvas REST API and AWS S3
-      
-    AWS CLI Optimization (Run once in terminal to support parallel pushes):
-      aws configure set default.s3.max_concurrent_requests 50
-      aws configure set default.s3.max_queue_size 10000
 
 .PARAMETER CanvasBaseUrl
     Canvas instance URL, e.g. https://your-school.instructure.com
@@ -75,25 +100,7 @@
     Bypass same-day deduplication and always submit a fresh Canvas export.
 
 # ============================================================
-# Appendix - Encrypted config setup (run once)
-# ============================================================
-# Run this block manually in PowerShell as the SAME Windows user
-# account that will run the scheduled task. This creates:
-#   C:\Scripts\canvas-backup-config.clixml
-#
-#   $configPath = 'C:\Scripts\canvas-backup-config.clixml'
-#   $config = [pscustomobject]@{
-#       CanvasBaseUrl   = Read-Host 'Canvas Base URL'
-#       S3Bucket        = Read-Host 'S3 Bucket'
-#       AwsRegion       = Read-Host 'AWS Region'
-#       RootAccountId   = Read-Host 'Root Account ID (Default is 1)'
-#       CanvasApiToken  = Read-Host 'Canvas API Token' -AsSecureString
-#  }
-#   $config | Export-Clixml -Path $configPath
-# ============================================================
-
-# ============================================================
-# Appendix - Windows Task Scheduler setup (run once, as admin)
+# Appendix - Windows Task Scheduler setup (Task must run as same user that made the config file!)
 # ============================================================
 #   $action  = New-ScheduledTaskAction -Execute 'powershell.exe' `
 #                  -Argument '-NonInteractive -File "C:\Scripts\Invoke-CanvasNightlyBackup.ps1"'
@@ -548,10 +555,9 @@ function Get-CourseS3BaseKey {
 }
 
 # ============================================================
-# Modular Backup Routines (Pages, Files, Gradebooks, Sub-Account Content)
+# Modular Backup Routines (Used for Sub-Account Loop)
 # ============================================================
 function Backup-CourseContent {
-    # Synchronous function used exclusively for the persistent sub-account loop.
     param($ExportData)
     Set-StrictMode -Off
 
@@ -1335,41 +1341,183 @@ function Main {
         $cW = @($contentResults | Where-Object { $_ -and $_.PSObject.Properties.Name -contains 'Action' -and $_.Action -eq 'written' }).Count
 
         # ------------------------------------------------------------
-        # Pages export pass
+        # Generic Worker Job Block (Pages, Files, Gradebooks)
+        # ------------------------------------------------------------
+        $DataWorkerJobBlock = {
+            param($ArgsHash)
+            Set-StrictMode -Off
+
+            $TaskType = $ArgsHash.TaskType
+            $CanvasApiToken = $ArgsHash.CanvasApiToken
+            $CanvasBaseUrl = $ArgsHash.CanvasBaseUrl
+            $S3Bucket = $ArgsHash.S3Bucket
+            $AwsRegion = $ArgsHash.AwsRegion
+            $TempDir = $ArgsHash.TempDir
+            $Force = $ArgsHash.Force
+            $WhatIfMode = $ArgsHash.WhatIfMode
+            $TodayString = $ArgsHash.TodayString
+
+            # --- INJECTED HELPER FUNCTIONS ---
+            function Get-JsonValue { param($Obj, [string]$Property) if ($null -eq $Obj) { return $null }; if ($Obj -is [hashtable]) { return $Obj[$Property] }; if ($Obj.PSObject.Properties.Match($Property).Count -gt 0) { return $Obj.$Property }; return $null }
+            function Invoke-CanvasApiPage { param([string]$Url) $attempt = 0; while ($true) { $attempt++; try { return Invoke-WebRequest -Uri $Url -Method Get -Headers @{ Authorization = "Bearer $CanvasApiToken" } -UseBasicParsing -TimeoutSec 60 } catch [System.Net.WebException] { $response = $_.Exception.Response; if ($response -and $response.StatusCode -eq 429) { $ra = 10; if ($response.Headers['Retry-After']) { try { $ra = [int]$response.Headers['Retry-After'] } catch {} }; Start-Sleep -Seconds $ra } elseif ($attempt -lt 3) { Start-Sleep -Seconds (5 * $attempt) } else { throw } } } }
+            function Invoke-CanvasGet { param([string]$Endpoint, [hashtable]$Query = @{}) $base = $CanvasBaseUrl.TrimEnd('/'); $qs = @(); $hasPerPage = $false; foreach ($kv in $Query.GetEnumerator()) { if ($kv.Key -eq 'per_page') { $hasPerPage = $true }; $qs += "$([Uri]::EscapeDataString($kv.Key))=$([Uri]::EscapeDataString([string]$kv.Value))" }; if (-not $hasPerPage) { $qs += 'per_page=100' }; $url = "$base/api/v1${Endpoint}?" + ($qs -join '&'); $results = @(); do { $resp = Invoke-CanvasApiPage -Url $url; $page = $resp.Content | ConvertFrom-Json; if ($null -ne $page) { $results += @($page) }; $url = $null; $linkHeader = $resp.Headers['Link']; if ($linkHeader -and ($linkHeader -match '<([^>]+)>;\s*rel="next"')) { $url = $Matches[1] } } while ($url); return $results }
+            function Publish-FileToS3 { param([string]$LocalPath, [string]$Key, [string]$StorageClass = 'GLACIER_IR') if ($WhatIfMode) { return }; & aws s3 cp $LocalPath "s3://$S3Bucket/$Key" --storage-class $StorageClass --region $AwsRegion --no-progress; if ($LASTEXITCODE -ne 0) { throw "aws s3 cp failed" } }
+            function Publish-TextToS3 { param([string]$Text, [string]$Key) $tmpFile = Join-Path $TempDir "s3-text-$([Guid]::NewGuid()).txt"; try { [System.IO.File]::WriteAllText($tmpFile, $Text, [System.Text.Encoding]::UTF8); Publish-FileToS3 -LocalPath $tmpFile -Key $Key -StorageClass 'STANDARD' } finally { if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue } } }
+            function Invoke-S3CopyObject { param([string]$SourceKey, [string]$DestKey) if ($WhatIfMode) { return }; & aws s3 cp "s3://$S3Bucket/$SourceKey" "s3://$S3Bucket/$DestKey" --metadata-directive COPY --storage-class GLACIER_IR --region $AwsRegion --no-progress; if ($LASTEXITCODE -ne 0) { throw "aws s3 copy failed" } }
+            function Get-S3ObjectsUnderPrefix { param([string]$Prefix) $results = @(); $token = $null; $oldEAP = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; do { $awsArgs = @('s3api', 'list-objects-v2', '--bucket', $S3Bucket, '--prefix', $Prefix, '--output', 'json', '--region', $AwsRegion); if ($token) { $awsArgs += @('--continuation-token', $token) }; $json = & aws @awsArgs 2>$null; if ($LASTEXITCODE -ne 0 -or -not $json -or $json -eq 'null') { break }; $page = $json | ConvertFrom-Json; if ($null -eq $page) { break }; if (Get-JsonValue $page 'Contents') { $results += @($page.Contents | Select-Object Key, LastModified) }; $isTrunc = Get-JsonValue $page 'IsTruncated'; $nxtTok = Get-JsonValue $page 'NextContinuationToken'; if ($isTrunc -and $nxtTok) { $token = $page.NextContinuationToken } else { $token = $null } } while ($token); $ErrorActionPreference = $oldEAP; if (-not $results) { return @() }; return @($results | Sort-Object { [datetime]$_.LastModified } -Descending) }
+            function Invoke-S3Prune { param([string]$Prefix, [int]$KeepCount, [string]$Ext) $objects = @(Get-S3ObjectsUnderPrefix -Prefix $Prefix | Where-Object { $_.Key.EndsWith($Ext) }); if ($objects.Count -le $KeepCount) { return }; $toDelete = @($objects | Select-Object -Skip $KeepCount); foreach ($obj in $toDelete) { if (-not $WhatIfMode) { & aws s3api delete-object --bucket $S3Bucket --key $obj.Key --region $AwsRegion | Out-Null } } }
+            function Invoke-TieredPromotion { param([string]$BaseKey, [string]$Ext) $dailyKey = "$BaseKey/daily/$TodayString$Ext"; $weeklyObjs = @(Get-S3ObjectsUnderPrefix "$BaseKey/weekly/"); $monthlyObjs = @(Get-S3ObjectsUnderPrefix "$BaseKey/monthly/"); $daysSinceWeekly = 999; $daysSinceMonthly = 999; if ($weeklyObjs.Count -gt 0) { $daysSinceWeekly = ((Get-Date) - [datetime]$weeklyObjs[0].LastModified).TotalDays }; if ($monthlyObjs.Count -gt 0) { $daysSinceMonthly = ((Get-Date) - [datetime]$monthlyObjs[0].LastModified).TotalDays }; if ($daysSinceWeekly -ge 7) { Invoke-S3CopyObject -SourceKey $dailyKey -DestKey "$BaseKey/weekly/$TodayString$Ext" }; if ($daysSinceWeekly -ge 7 -and $daysSinceMonthly -ge 30) { Invoke-S3CopyObject -SourceKey $dailyKey -DestKey "$BaseKey/monthly/$TodayString$Ext" }; Invoke-S3Prune -Prefix "$BaseKey/daily/" -KeepCount 14 -Ext $Ext; Invoke-S3Prune -Prefix "$BaseKey/weekly/" -KeepCount 5 -Ext $Ext; Invoke-S3Prune -Prefix "$BaseKey/monthly/" -KeepCount 6 -Ext $Ext }
+            function Format-CsvField { param([string]$Value) if ($null -eq $Value) { $Value = '' }; '"' + ($Value -replace '"', '""') + '"' }
+
+            # --- WORKER LOOP ---
+            $output = @()
+            foreach ($c in $ArgsHash.Chunk) {
+                $courseId = $c.CourseId
+
+                if ($TaskType -eq 'Pages') {
+                    if ($WhatIfMode) { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'dryrun' }; continue }
+                    try {
+                        $pages = @(Invoke-CanvasGet "/courses/$courseId/pages" @{ 'include[]' = 'body' })
+                        if ($pages.Count -gt 0) {
+                            $jsonText = $pages | ConvertTo-Json -Depth 10 -Compress
+                            Publish-TextToS3 -Text $jsonText -Key $c.DailyPages
+                            Invoke-TieredPromotion -BaseKey "$($c.BaseKey)-pages" -Ext '.json'
+                            $output += [pscustomobject]@{ CourseId = $courseId; Action = 'written'; Items = $pages.Count }
+                        } else { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'skipped' } }
+                    } catch { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'failed'; Error = $_.Exception.Message } }
+                }
+                
+                elseif ($TaskType -eq 'Files') {
+                    if ($WhatIfMode) { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'dryrun' }; continue }
+                    try {
+                        $folders = @(Invoke-CanvasGet "/courses/$courseId/folders"); $files = @(Invoke-CanvasGet "/courses/$courseId/files" @{ 'per_page' = '500' })
+                        if ($files.Count -gt 0) {
+                            $folderMap = @{}; foreach ($f in $folders) { $folderMap["$($f.id)"] = $f.full_name }
+                            $localDir = Join-Path $TempDir "files-$courseId-$([Guid]::NewGuid())"
+                            New-Item -ItemType Directory -Path $localDir -Force | Out-Null
+                            foreach ($file in $files) {
+                                if (-not $file.url) { continue }
+                                $fId = "$($file.folder_id)"; $path = if ($folderMap.ContainsKey($fId)) { $folderMap[$fId] } else { "" }
+                                $path = $path -replace '(?i)^course files[/\\]?', ''
+                                $targetDir = Join-Path $localDir $path
+                                if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+                                Invoke-WebRequest -Uri $file.url -OutFile (Join-Path $targetDir $file.display_name) -UseBasicParsing -TimeoutSec 600
+                            }
+                            $zipPath = Join-Path $TempDir "files-$courseId-$([Guid]::NewGuid()).zip"
+                            Compress-Archive -Path "$localDir\*" -DestinationPath $zipPath -CompressionLevel Fastest
+                            Publish-FileToS3 -LocalPath $zipPath -Key $c.DailyFiles
+                            Invoke-TieredPromotion -BaseKey "$($c.BaseKey)-files" -Ext '.zip'
+                            if (Test-Path $localDir) { Remove-Item $localDir -Recurse -Force -ErrorAction SilentlyContinue }
+                            if (Test-Path $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
+                            $output += [pscustomobject]@{ CourseId = $courseId; Action = 'written'; Items = $files.Count }
+                        } else { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'skipped' } }
+                    } catch { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'failed'; Error = $_.Exception.Message } }
+                }
+
+                elseif ($TaskType -eq 'Gradebook') {
+                    if ($WhatIfMode) { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'dryrun' }; continue }
+                    try {
+                        $assignments = @(Invoke-CanvasGet "/courses/$courseId/assignments")
+                        $enrollments = @(Invoke-CanvasGet "/courses/$courseId/enrollments" @{ 'type[]' = 'StudentEnrollment'; 'include[]' = 'user,grades' })
+                        if ($enrollments.Count -gt 0) {
+                            $submissions = @(Invoke-CanvasGet "/courses/$courseId/students/submissions" @{ 'student_ids[]' = 'all'; 'per_page' = '100' })
+                            $asgnGroups = @(Invoke-CanvasGet "/courses/$courseId/assignment_groups" @{ 'include[]' = 'assignments' })
+                            $subLookup = @{}; foreach ($sub in $submissions) { $subLookup["$($sub.user_id)_$($sub.assignment_id)"] = if ($null -ne $sub.score) { "$($sub.score)" } else { '' } }
+                            $groupNames = @{}; foreach ($grp in $asgnGroups) { $groupNames["$($grp.id)"] = $grp.name }
+                            $header = @('Student', 'ID', 'SIS User ID', 'SIS Login ID', 'Section', 'Current Score', 'Unposted Current Score', 'Final Score', 'Unposted Final Score', 'Current Grade', 'Unposted Current Grade', 'Final Grade', 'Unposted Final Grade')
+                            foreach ($asgn in $assignments) { $gName = if ($groupNames.ContainsKey("$($asgn.assignment_group_id)")) { $groupNames["$($asgn.assignment_group_id)"] } else { '' }; $header += "$($asgn.name) ($gName) [$($asgn.id)]" }
+                            $lines = @((($header | ForEach-Object { Format-CsvField $_ }) -join ','))
+                            foreach ($enr in $enrollments) {
+                                $user = $enr.user; $grades = $enr.grades; $sid = "$($enr.user_id)"
+                                $row = @( $(if ($user.sortable_name) { $user.sortable_name } else { '' }), $sid, $(if ($user.sis_user_id) { $user.sis_user_id } else { '' }), $(if ($user.login_id) { $user.login_id } else { '' }), $(if ($enr.sis_section_id) { $enr.sis_section_id } else { '' }), $(if ($null -ne $grades.current_score) { "$($grades.current_score)" } else { '' }), $(if ($null -ne $grades.unposted_current_score) { "$($grades.unposted_current_score)" } else { '' }), $(if ($null -ne $grades.final_score) { "$($grades.final_score)" } else { '' }), $(if ($null -ne $grades.unposted_final_score) { "$($grades.unposted_final_score)" } else { '' }), $(if ($grades.current_grade) { $grades.current_grade } else { '' }), $(if ($grades.unposted_current_grade) { $grades.unposted_current_grade } else { '' }), $(if ($grades.final_grade) { $grades.final_grade } else { '' }), $(if ($grades.unposted_final_grade) { $grades.unposted_final_grade } else { '' }) )
+                                foreach ($asgn in $assignments) { $subKey = $sid + "_" + $asgn.id; $row += if ($subLookup.ContainsKey($subKey)) { $subLookup[$subKey] } else { '' } }
+                                $lines += (($row | ForEach-Object { Format-CsvField $_ }) -join ',')
+                            }
+                            $tmpCsv = Join-Path $TempDir "gradebook-$courseId-$([Guid]::NewGuid()).csv"
+                            [System.IO.File]::WriteAllBytes($tmpCsv, ([System.Text.Encoding]::UTF8.GetPreamble() + [System.Text.Encoding]::UTF8.GetBytes($lines -join "`r`n")))
+                            Publish-FileToS3 -LocalPath $tmpCsv -Key $c.DailyGrades
+                            Invoke-TieredPromotion -BaseKey "$($c.BaseKey)-gradebook" -Ext '.csv'
+                            if (Test-Path $tmpCsv) { Remove-Item $tmpCsv -Force -ErrorAction SilentlyContinue }
+                            $output += [pscustomobject]@{ CourseId = $courseId; Action = 'written'; Items = $enrollments.Count }
+                        } else { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'skipped' } }
+                    } catch { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'failed'; Error = $_.Exception.Message } }
+                }
+            }
+            return $output
+        }
+
+        # ------------------------------------------------------------
+        # Pages export pass (Parallelized)
         # ------------------------------------------------------------
         $pagesResults = @()
         if ($SkipPages) { Write-Warn "Skipping Pages export pass" }
         else {
-            Write-Info "=== Backing up Pages ==="
+            Write-Info "=== Backing up Pages (3 Parallel Jobs) ==="
+            $pagesToExport = @()
             foreach ($c in $exportList) {
-                $pagesResults += Backup-CoursePages -ExportData $c -S3Cache $s3Cache
+                if (-not $Force -and $s3Cache.ContainsKey($c.DailyPages)) { $pagesResults += [pscustomobject]@{ CourseId = $c.CourseId; Action = 'skipped' } }
+                else { $pagesToExport += $c }
             }
+            
+            $sliceSize = if ($pagesToExport.Count -gt 0) { [math]::Ceiling($pagesToExport.Count / 3) } else { 1 }
+            $jobChunks = @()
+            for ($i = 0; $i -lt $pagesToExport.Count; $i += $sliceSize) { $jobChunks += ,@($pagesToExport[$i..[math]::Min($i+$sliceSize-1, $pagesToExport.Count - 1)]) }
+
+            foreach ($chunk in $jobChunks) {
+                $argsHash = @{ TaskType = 'Pages'; Chunk = $chunk; CanvasApiToken = $CanvasApiToken; CanvasBaseUrl = $CanvasBaseUrl; S3Bucket = $S3Bucket; AwsRegion = $AwsRegion; TempDir = $TempDir; Force = $Force; WhatIfMode = $WhatIfMode; TodayString = $todayString }
+                Start-Job -Name "PagesJob" -ScriptBlock $DataWorkerJobBlock -ArgumentList $argsHash | Out-Null
+            }
+            Get-Job -Name "PagesJob" | Wait-Job | ForEach-Object { $pagesResults += Receive-Job -Job $_; Remove-Job -Job $_ }
         }
         $pW = @($pagesResults | Where-Object { $_ -and $_.PSObject.Properties.Name -contains 'Action' -and $_.Action -eq 'written' }).Count
 
         # ------------------------------------------------------------
-        # Files export pass
+        # Files export pass (Parallelized)
         # ------------------------------------------------------------
         $filesResults = @()
         if ($SkipFiles) { Write-Warn "Skipping Files export pass" }
         else {
-            Write-Info "=== Backing up Files ==="
+            Write-Info "=== Backing up Files (3 Parallel Jobs) ==="
+            $filesToExport = @()
             foreach ($c in $exportList) {
-                $filesResults += Backup-CourseFiles -ExportData $c -S3Cache $s3Cache
+                if (-not $Force -and $s3Cache.ContainsKey($c.DailyFiles)) { $filesResults += [pscustomobject]@{ CourseId = $c.CourseId; Action = 'skipped' } }
+                else { $filesToExport += $c }
             }
+            
+            $sliceSize = if ($filesToExport.Count -gt 0) { [math]::Ceiling($filesToExport.Count / 3) } else { 1 }
+            $jobChunks = @()
+            for ($i = 0; $i -lt $filesToExport.Count; $i += $sliceSize) { $jobChunks += ,@($filesToExport[$i..[math]::Min($i+$sliceSize-1, $filesToExport.Count - 1)]) }
+
+            foreach ($chunk in $jobChunks) {
+                $argsHash = @{ TaskType = 'Files'; Chunk = $chunk; CanvasApiToken = $CanvasApiToken; CanvasBaseUrl = $CanvasBaseUrl; S3Bucket = $S3Bucket; AwsRegion = $AwsRegion; TempDir = $TempDir; Force = $Force; WhatIfMode = $WhatIfMode; TodayString = $todayString }
+                Start-Job -Name "FilesJob" -ScriptBlock $DataWorkerJobBlock -ArgumentList $argsHash | Out-Null
+            }
+            Get-Job -Name "FilesJob" | Wait-Job | ForEach-Object { $filesResults += Receive-Job -Job $_; Remove-Job -Job $_ }
         }
         $fW = @($filesResults | Where-Object { $_ -and $_.PSObject.Properties.Name -contains 'Action' -and $_.Action -eq 'written' }).Count
 
         # ------------------------------------------------------------
-        # Gradebook export pass
+        # Gradebook export pass (Parallelized)
         # ------------------------------------------------------------
         $gradebookResults = @()
         if ($SkipGradebooks) { Write-Warn "Skipping Gradebook export pass" }
         else {
-            Write-Info "=== Backing up Gradebooks ==="
+            Write-Info "=== Backing up Gradebooks (3 Parallel Jobs) ==="
+            $gradesToExport = @()
             foreach ($c in $exportList) {
-                $gradebookResults += Backup-CourseGradebook -ExportData $c -S3Cache $s3Cache
+                if (-not $Force -and $s3Cache.ContainsKey($c.DailyGrades)) { $gradebookResults += [pscustomobject]@{ CourseId = $c.CourseId; Action = 'skipped' } }
+                else { $gradesToExport += $c }
             }
+            
+            $sliceSize = if ($gradesToExport.Count -gt 0) { [math]::Ceiling($gradesToExport.Count / 3) } else { 1 }
+            $jobChunks = @()
+            for ($i = 0; $i -lt $gradesToExport.Count; $i += $sliceSize) { $jobChunks += ,@($gradesToExport[$i..[math]::Min($i+$sliceSize-1, $gradesToExport.Count - 1)]) }
+
+            foreach ($chunk in $jobChunks) {
+                $argsHash = @{ TaskType = 'Gradebook'; Chunk = $chunk; CanvasApiToken = $CanvasApiToken; CanvasBaseUrl = $CanvasBaseUrl; S3Bucket = $S3Bucket; AwsRegion = $AwsRegion; TempDir = $TempDir; Force = $Force; WhatIfMode = $WhatIfMode; TodayString = $todayString }
+                Start-Job -Name "GradebookJob" -ScriptBlock $DataWorkerJobBlock -ArgumentList $argsHash | Out-Null
+            }
+            Get-Job -Name "GradebookJob" | Wait-Job | ForEach-Object { $gradebookResults += Receive-Job -Job $_; Remove-Job -Job $_ }
         }
         $gW = @($gradebookResults | Where-Object { $_ -and $_.PSObject.Properties.Name -contains 'Action' -and $_.Action -eq 'written' }).Count
 
