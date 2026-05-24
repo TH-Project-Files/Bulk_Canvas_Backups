@@ -120,6 +120,7 @@ Logs are written to `C:\Scripts\Logs\` and temporary processing data to `C:\Scri
 | **`-SkipGradebooks`** | Skips `.csv` gradebook backups. | `-SkipGradebooks` |
 | **`-WhatIfMode`** | Dry run (no S3/Canvas writes). | `-WhatIfMode` |
 | **`-Force`** | Ignores same-day deduplication. | `-Force` |
+| **`-ConcurrentJobs`** | Increase subworkers for larger sites, default is 5. | `-ConcurrentJobs` |
 
 ---
 
