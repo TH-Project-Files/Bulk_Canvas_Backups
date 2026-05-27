@@ -11,10 +11,12 @@
       1. Load encrypted configuration from C:\Scripts\canvas-backup-config.clixml
       2. Resolve terms and enumerate active courses
       3. Bulk-cache today's existing S3 backups to memory (High-Speed Deduplication)
-      4. Back up course content packages (.imscc) - (5 Parallel Background Jobs)
-      5. Back up course Pages (JSON with HTML body) - (3 Parallel Background Jobs)
-      6. Back up course Files (.zip archive of raw files) - (3 Parallel Background Jobs)
-      7. Back up gradebook CSVs - (3 Parallel Background Jobs)
+      4. Back up course content packages (.imscc) - (Configurable Parallel Background Jobs)
+      5. Back up gradebook CSVs - (Configurable Parallel Background Jobs)
+      6. Back up course Pages (JSON with HTML body) - (Configurable Parallel Background Jobs)
+      7. Back up course Files (.zip archive of raw files) - (Configurable Parallel Background Jobs)
+         * Includes an automated HDD cache safeguard to ensure local temp files never exceed 100GB.
+         * Features Bin Packing: Auto-splits courses > 80GB into multiple 50GB zip parts to protect RAM/HDD.
       8. Optionally recurse through all Canvas sub-accounts for persistent backups
       9. Verify S3 coverage and upload run logs
 
@@ -72,6 +74,11 @@
 .PARAMETER LogDir
     Directory for transcript log files.
 
+.PARAMETER ConcurrentJobs
+    Number of parallel background jobs to run for data extraction (Content, Pages, Files, Gradebooks).
+    Default is 5. Increase for larger organizations with robust servers (e.g., -ConcurrentJobs 10) 
+    or decrease for smaller/resource-constrained environments (e.g., -ConcurrentJobs 2).
+
 .PARAMETER CourseId
     Optional single-course mode.
 
@@ -100,15 +107,21 @@
     Bypass same-day deduplication and always submit a fresh Canvas export.
 
 # ============================================================
-# Appendix - Windows Task Scheduler setup (Task must run as same user that made the config file!)
+# Appendix - Windows Task Scheduler setup (run once, as admin)
 # ============================================================
+# CRITICAL: The scheduled task MUST execute under the exact same 
+# Windows user account that generated the encrypted config file.
+# Otherwise, it will fail to decrypt the Canvas API token.
+#
 #   $action  = New-ScheduledTaskAction -Execute 'powershell.exe' `
 #                  -Argument '-NonInteractive -File "C:\Scripts\Invoke-CanvasNightlyBackup.ps1"'
 #   $trigger = New-ScheduledTaskTrigger -Daily -At '3:00AM'
 #   $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 4)
+#   $runAsUser = $env:USERNAME # Ensure this matches the user from the config step!
+#
 #   Register-ScheduledTask -TaskName 'Canvas Nightly Backup' `
 #       -Action $action -Trigger $trigger -Settings $settings `
-#       -RunLevel Highest -Force
+#       -RunLevel Highest -User $runAsUser -Force
 # ============================================================
 #>
 
@@ -122,6 +135,7 @@ param(
     [string]$LogDir,
     [int]$PollTimeoutMins = 60,
     [int]$PollIntervalSecs = 3,
+    [int]$ConcurrentJobs = 5,
     [string]$CourseId,
     [int]$MaxCourses = 0,
     [switch]$SkipSubAccounts,
@@ -135,6 +149,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# Ensure a minimum of 1 concurrent job to prevent math errors
+if ($ConcurrentJobs -lt 1) { $ConcurrentJobs = 1 }
 
 # ---------------------------------------------------------------------------
 # Fixed working paths
@@ -350,8 +367,27 @@ function Publish-FileToS3 {
         Write-DryRun "Would upload '$LocalPath' to s3://$S3Bucket/$Key (storage-class=$StorageClass)"
         return
     }
-    & aws s3 cp $LocalPath "s3://$S3Bucket/$Key" --storage-class $StorageClass --region $AwsRegion --no-progress
-    if ($LASTEXITCODE -ne 0) { throw "aws s3 cp failed for key: $Key" }
+
+    $maxRetries = 3
+    $attempt = 0
+    $success = $false
+
+    while ($attempt -lt $maxRetries -and -not $success) {
+        $attempt++
+        & aws s3 cp $LocalPath "s3://$S3Bucket/$Key" --storage-class $StorageClass --region $AwsRegion --no-progress
+        
+        if ($LASTEXITCODE -eq 0) {
+            $success = $true
+        } else {
+            if ($attempt -lt $maxRetries) {
+                $sleepTime = $attempt * 10
+                Write-Warn "S3 Upload dropped for $Key. Retrying in $sleepTime seconds... (Attempt $attempt of $maxRetries)"
+                Start-Sleep -Seconds $sleepTime
+            }
+        }
+    }
+
+    if (-not $success) { throw "aws s3 cp failed for key: $Key after $maxRetries attempts." }
 }
 
 function Publish-TextToS3 {
@@ -680,43 +716,89 @@ function Backup-CourseFiles {
         
         if ($files.Count -eq 0) { return [pscustomobject]@{ CourseId = $courseId; Action = 'skipped'; SkipReason = 'no files' } }
 
+        $totalCourseSize = 0
+        foreach ($f in $files) { $totalCourseSize += [long]$f.size }
+        $eightyGB = 80GB
+        $fiftyGB = 50GB
+        $maxBlockSize = if ($totalCourseSize -gt $eightyGB) { $fiftyGB } else { $totalCourseSize + 1GB }
+
         $folderMap = @{}
         foreach ($f in $folders) { $folderMap["$($f.id)"] = $f.full_name }
 
-        $localDir = Join-Path $TempDir "files-$courseId-$([Guid]::NewGuid())"
-        New-Item -ItemType Directory -Path $localDir -Force | Out-Null
+        $currentBlock = @()
+        $currentBlockSize = 0
+        $blockNumber = 1
+        $totalItemsProcessed = 0
 
-        Write-Info "[$courseId] Downloading $($files.Count) files locally..."
-        foreach ($file in $files) {
-            if (-not $file.url) { continue }
-            $fId = "$($file.folder_id)"
-            $path = if ($folderMap.ContainsKey($fId)) { $folderMap[$fId] } else { "" }
-            $path = $path -replace '(?i)^course files[/\\]?', ''
+        function Process-FileBlock {
+            param($BlockFiles, $BNum)
+            if ($BlockFiles.Count -eq 0) { return }
 
-            $targetDir = Join-Path $localDir $path
-            if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+            # Safegaurd to block any jobs from proceeding if global cached disk space is > 100GB
+            $maxCacheBytes = 100GB
+            while ($true) {
+                $currentCacheBytes = 0
+                if (Test-Path $TempDir) {
+                    $currentCacheBytes = (Get-ChildItem $TempDir -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+                }
+                if ($null -eq $currentCacheBytes) { $currentCacheBytes = 0 }
+                if ($currentCacheBytes -lt $maxCacheBytes) { break }
+                Start-Sleep -Seconds 10
+            }
 
-            $targetFile = Join-Path $targetDir $file.display_name
-            Invoke-WebRequest -Uri $file.url -OutFile $targetFile -UseBasicParsing -TimeoutSec 600
+            $localDir = Join-Path $TempDir "files-$courseId-$([Guid]::NewGuid())"
+            New-Item -ItemType Directory -Path $localDir -Force | Out-Null
+            
+            foreach ($bf in $BlockFiles) {
+                if (-not $bf.url) { continue }
+                $fId = "$($bf.folder_id)"
+                $path = if ($folderMap.ContainsKey($fId)) { $folderMap[$fId] } else { "" }
+                $path = $path -replace '(?i)^course files[/\\]?', ''
+
+                $targetDir = Join-Path $localDir $path
+                if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+                Invoke-WebRequest -Uri $bf.url -OutFile (Join-Path $targetDir $bf.display_name) -UseBasicParsing -TimeoutSec 600
+            }
+
+            $zipPath = Join-Path $TempDir "files-$courseId-part$BNum-$([Guid]::NewGuid()).zip"
+            if ($totalCourseSize -gt $eightyGB) { Write-Info "[$courseId] Zipping part $BNum..." } else { Write-Info "[$courseId] Zipping files..." }
+            
+            Compress-Archive -Path "$localDir\*" -DestinationPath $zipPath -CompressionLevel Fastest
+
+            $blockKey = if ($totalCourseSize -gt $eightyGB) { $dailyKey -replace '\.zip$', "-part$BNum.zip" } else { $dailyKey }
+            $blockExt = if ($totalCourseSize -gt $eightyGB) { "-part$BNum.zip" } else { ".zip" }
+
+            Publish-FileToS3 -LocalPath $zipPath -Key $blockKey
+            Invoke-TieredPromotion -BaseKey $filesBaseKey -Today (Get-Date -Format 'yyyy-MM-dd') -Ext $blockExt
+
+            if (Test-Path $localDir) { Remove-Item $localDir -Recurse -Force -ErrorAction SilentlyContinue }
+            if (Test-Path $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
         }
 
-        $zipPath = Join-Path $TempDir "files-$courseId-$([Guid]::NewGuid()).zip"
-        Write-Info "[$courseId] Zipping files..."
-        Compress-Archive -Path "$localDir\*" -DestinationPath $zipPath -CompressionLevel Fastest
+        foreach ($file in $files) {
+            $fSize = [long]$file.size
+            if (($currentBlockSize + $fSize) -gt $maxBlockSize -and $currentBlock.Count -gt 0) {
+                Process-FileBlock -BlockFiles $currentBlock -BNum $blockNumber
+                $totalItemsProcessed += $currentBlock.Count
+                $currentBlock = @()
+                $currentBlockSize = 0
+                $blockNumber++
+            }
+            $currentBlock += $file
+            $currentBlockSize += $fSize
+        }
 
-        Publish-FileToS3 -LocalPath $zipPath -Key $dailyKey
-        Invoke-TieredPromotion -BaseKey $filesBaseKey -Today (Get-Date -Format 'yyyy-MM-dd') -Ext '.zip'
+        if ($currentBlock.Count -gt 0) {
+            Process-FileBlock -BlockFiles $currentBlock -BNum $blockNumber
+            $totalItemsProcessed += $currentBlock.Count
+        }
 
-        Write-Ok "[$courseId] Files ($($files.Count) items) -> s3://$S3Bucket/$dailyKey"
-        [pscustomobject]@{ CourseId = $courseId; Action = 'written'; S3Key = $dailyKey; Items = $files.Count }
+        Write-Ok "[$courseId] Files ($totalItemsProcessed items) -> s3://$S3Bucket/$dailyKey"
+        [pscustomobject]@{ CourseId = $courseId; Action = 'written'; S3Key = $dailyKey; Items = $totalItemsProcessed }
     }
     catch {
         Write-Fail "[$courseId] Files fetch/zip failed: $_"
         [pscustomobject]@{ CourseId = $courseId; Action = 'failed'; Error = "$_" }
-    }
-    finally {
-        if ($null -ne $localDir -and (Test-Path $localDir)) { Remove-Item $localDir -Recurse -Force -ErrorAction SilentlyContinue }
-        if ($null -ne $zipPath -and (Test-Path $zipPath)) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -876,9 +958,9 @@ function Backup-SubAccount {
         }
 
         if (-not $SkipContent) { $contentResults += Backup-CourseContent -ExportData $exportData }
+        if (-not $SkipGradebooks) { Backup-CourseGradebook -ExportData $exportData | Out-Null }
         if (-not $SkipPages) { Backup-CoursePages -ExportData $exportData | Out-Null }
         if (-not $SkipFiles) { Backup-CourseFiles -ExportData $exportData | Out-Null }
-        if (-not $SkipGradebooks) { Backup-CourseGradebook -ExportData $exportData | Out-Null }
     }
 
     $written = @($contentResults | Where-Object { $_.Action -eq 'written' }).Count
@@ -967,6 +1049,7 @@ function Main {
         Write-Info "S3: s3://$S3Bucket (region: $AwsRegion)"
         Write-Info "Root Account ID: $RootAccountId"
         Write-Info "Local TempDir: $TempDir"
+        Write-Info "Concurrent Jobs: $ConcurrentJobs"
 
         if ($Force) { Write-Warn "Force mode - same-day dedup bypassed" }
         if ($CourseId) { Write-Warn "Test mode: filtering to CourseId=$CourseId" }
@@ -1081,7 +1164,7 @@ function Main {
             Write-Warn "Skipping course content export (.imscc) pass"
         }
         else {
-            Write-Info "=== Backing up course content exports (BACKGROUND JOBS) ==="
+            Write-Info "=== Backing up course content exports ($ConcurrentJobs BACKGROUND JOBS) ==="
             
             $exportJobBlock = {
                 param($ArgsHash)
@@ -1147,9 +1230,16 @@ function Main {
                 }
 
                 function Publish-FileToS3 {
-                    param([string]$LocalPath, [string]$Key)
-                    & aws s3 cp $LocalPath "s3://$S3Bucket/$Key" --storage-class GLACIER_IR --region $AwsRegion --no-progress
-                    if ($LASTEXITCODE -ne 0) { throw "aws s3 cp failed" }
+                    param([string]$LocalPath, [string]$Key, [string]$StorageClass = 'GLACIER_IR')
+                    $maxRetries = 3
+                    $attempt = 0
+                    $success = $false
+                    while ($attempt -lt $maxRetries -and -not $success) {
+                        $attempt++
+                        & aws s3 cp $LocalPath "s3://$S3Bucket/$Key" --storage-class $StorageClass --region $AwsRegion --no-progress
+                        if ($LASTEXITCODE -eq 0) { $success = $true } else { if ($attempt -lt $maxRetries) { $sleepTime = $attempt * 10; Start-Sleep -Seconds $sleepTime } }
+                    }
+                    if (-not $success) { throw "aws s3 cp failed" }
                 }
 
                 function Invoke-S3CopyObject {
@@ -1289,7 +1379,7 @@ function Main {
                 $chunks += ,@($coursesToExport[$i..[math]::Min($i+4, $coursesToExport.Count - 1)])
             }
 
-            # Orchestrate Background Jobs (Maintain 5 active threads)
+            # Orchestrate Background Jobs (Maintain $ConcurrentJobs active threads)
             $chunkIndex = 0
             while ($true) {
                 $jobs = Get-Job -Command "*CanvasExport*" 2>$null
@@ -1315,7 +1405,7 @@ function Main {
                 $runningJobs = @($jobs | Where-Object State -eq 'Running')
                 if ($chunkIndex -ge $chunks.Count -and $runningJobs.Count -eq 0) { break }
 
-                while ($chunkIndex -lt $chunks.Count -and $runningJobs.Count -lt 5) {
+                while ($chunkIndex -lt $chunks.Count -and $runningJobs.Count -lt $ConcurrentJobs) {
                     $chunk = $chunks[$chunkIndex]
                     $jobArgs = @{
                         Chunk = $chunk
@@ -1360,8 +1450,21 @@ function Main {
             # --- INJECTED HELPER FUNCTIONS ---
             function Get-JsonValue { param($Obj, [string]$Property) if ($null -eq $Obj) { return $null }; if ($Obj -is [hashtable]) { return $Obj[$Property] }; if ($Obj.PSObject.Properties.Match($Property).Count -gt 0) { return $Obj.$Property }; return $null }
             function Invoke-CanvasApiPage { param([string]$Url) $attempt = 0; while ($true) { $attempt++; try { return Invoke-WebRequest -Uri $Url -Method Get -Headers @{ Authorization = "Bearer $CanvasApiToken" } -UseBasicParsing -TimeoutSec 60 } catch [System.Net.WebException] { $response = $_.Exception.Response; if ($response -and $response.StatusCode -eq 429) { $ra = 10; if ($response.Headers['Retry-After']) { try { $ra = [int]$response.Headers['Retry-After'] } catch {} }; Start-Sleep -Seconds $ra } elseif ($attempt -lt 3) { Start-Sleep -Seconds (5 * $attempt) } else { throw } } } }
-            function Invoke-CanvasGet { param([string]$Endpoint, [hashtable]$Query = @{}) $base = $CanvasBaseUrl.TrimEnd('/'); $qs = @(); $hasPerPage = $false; foreach ($kv in $Query.GetEnumerator()) { if ($kv.Key -eq 'per_page') { $hasPerPage = $true }; $qs += "$([Uri]::EscapeDataString($kv.Key))=$([Uri]::EscapeDataString([string]$kv.Value))" }; if (-not $hasPerPage) { $qs += 'per_page=100' }; $url = "$base/api/v1${Endpoint}?" + ($qs -join '&'); $results = @(); do { $resp = Invoke-CanvasApiPage -Url $url; $page = $resp.Content | ConvertFrom-Json; if ($null -ne $page) { $results += @($page) }; $url = $null; $linkHeader = $resp.Headers['Link']; if ($linkHeader -and ($linkHeader -match '<([^>]+)>;\s*rel="next"')) { $url = $Matches[1] } } while ($url); return $results }
-            function Publish-FileToS3 { param([string]$LocalPath, [string]$Key, [string]$StorageClass = 'GLACIER_IR') if ($WhatIfMode) { return }; & aws s3 cp $LocalPath "s3://$S3Bucket/$Key" --storage-class $StorageClass --region $AwsRegion --no-progress; if ($LASTEXITCODE -ne 0) { throw "aws s3 cp failed" } }
+            function Invoke-CanvasGet { param([string]$Endpoint, [hashtable]$Query = @{}) $base = $CanvasBaseUrl.TrimEnd('/'); $qs = @(); $hasPerPage = $false; foreach ($kv in $Query.GetEnumerator()) { if ($kv.Key -eq 'per_page') { $hasPerPage = $true }; $qs += "$([Uri]::EscapeDataString($kv.Key))=$([Uri]::EscapeDataString([string]$kv.Value))" }; if (-not $hasPerPage) { $qs += 'per_page=100' }; $url = "$base/api/v1${Endpoint}?" + ($qs -join '&'); $results = @(); do { $resp = Invoke-CanvasApiPage -Url $url; $page = $resp.Content | ConvertFrom-Json; if ($null -ne $page) { $results += @($page) }; $url = $null; $linkHeader = $resp.Headers['Link']
+                    if ($linkHeader -and ($linkHeader -match '<([^>]+)>;\s*rel="next"')) { $url = $Matches[1] } } while ($url); return $results }
+            
+            function Publish-FileToS3 {
+                param([string]$LocalPath, [string]$Key, [string]$StorageClass = 'GLACIER_IR')
+                if ($WhatIfMode) { return }
+                $maxRetries = 3; $attempt = 0; $success = $false
+                while ($attempt -lt $maxRetries -and -not $success) {
+                    $attempt++
+                    & aws s3 cp $LocalPath "s3://$S3Bucket/$Key" --storage-class $StorageClass --region $AwsRegion --no-progress
+                    if ($LASTEXITCODE -eq 0) { $success = $true } else { if ($attempt -lt $maxRetries) { $sleepTime = $attempt * 10; Start-Sleep -Seconds $sleepTime } }
+                }
+                if (-not $success) { throw "aws s3 cp failed" }
+            }
+            
             function Publish-TextToS3 { param([string]$Text, [string]$Key) $tmpFile = Join-Path $TempDir "s3-text-$([Guid]::NewGuid()).txt"; try { [System.IO.File]::WriteAllText($tmpFile, $Text, [System.Text.Encoding]::UTF8); Publish-FileToS3 -LocalPath $tmpFile -Key $Key -StorageClass 'STANDARD' } finally { if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue } } }
             function Invoke-S3CopyObject { param([string]$SourceKey, [string]$DestKey) if ($WhatIfMode) { return }; & aws s3 cp "s3://$S3Bucket/$SourceKey" "s3://$S3Bucket/$DestKey" --metadata-directive COPY --storage-class GLACIER_IR --region $AwsRegion --no-progress; if ($LASTEXITCODE -ne 0) { throw "aws s3 copy failed" } }
             function Get-S3ObjectsUnderPrefix { param([string]$Prefix) $results = @(); $token = $null; $oldEAP = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; do { $awsArgs = @('s3api', 'list-objects-v2', '--bucket', $S3Bucket, '--prefix', $Prefix, '--output', 'json', '--region', $AwsRegion); if ($token) { $awsArgs += @('--continuation-token', $token) }; $json = & aws @awsArgs 2>$null; if ($LASTEXITCODE -ne 0 -or -not $json -or $json -eq 'null') { break }; $page = $json | ConvertFrom-Json; if ($null -eq $page) { break }; if (Get-JsonValue $page 'Contents') { $results += @($page.Contents | Select-Object Key, LastModified) }; $isTrunc = Get-JsonValue $page 'IsTruncated'; $nxtTok = Get-JsonValue $page 'NextContinuationToken'; if ($isTrunc -and $nxtTok) { $token = $page.NextContinuationToken } else { $token = $null } } while ($token); $ErrorActionPreference = $oldEAP; if (-not $results) { return @() }; return @($results | Sort-Object { [datetime]$_.LastModified } -Descending) }
@@ -1374,47 +1477,7 @@ function Main {
             foreach ($c in $ArgsHash.Chunk) {
                 $courseId = $c.CourseId
 
-                if ($TaskType -eq 'Pages') {
-                    if ($WhatIfMode) { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'dryrun' }; continue }
-                    try {
-                        $pages = @(Invoke-CanvasGet "/courses/$courseId/pages" @{ 'include[]' = 'body' })
-                        if ($pages.Count -gt 0) {
-                            $jsonText = $pages | ConvertTo-Json -Depth 10 -Compress
-                            Publish-TextToS3 -Text $jsonText -Key $c.DailyPages
-                            Invoke-TieredPromotion -BaseKey "$($c.BaseKey)-pages" -Ext '.json'
-                            $output += [pscustomobject]@{ CourseId = $courseId; Action = 'written'; Items = $pages.Count }
-                        } else { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'skipped' } }
-                    } catch { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'failed'; Error = $_.Exception.Message } }
-                }
-                
-                elseif ($TaskType -eq 'Files') {
-                    if ($WhatIfMode) { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'dryrun' }; continue }
-                    try {
-                        $folders = @(Invoke-CanvasGet "/courses/$courseId/folders"); $files = @(Invoke-CanvasGet "/courses/$courseId/files" @{ 'per_page' = '500' })
-                        if ($files.Count -gt 0) {
-                            $folderMap = @{}; foreach ($f in $folders) { $folderMap["$($f.id)"] = $f.full_name }
-                            $localDir = Join-Path $TempDir "files-$courseId-$([Guid]::NewGuid())"
-                            New-Item -ItemType Directory -Path $localDir -Force | Out-Null
-                            foreach ($file in $files) {
-                                if (-not $file.url) { continue }
-                                $fId = "$($file.folder_id)"; $path = if ($folderMap.ContainsKey($fId)) { $folderMap[$fId] } else { "" }
-                                $path = $path -replace '(?i)^course files[/\\]?', ''
-                                $targetDir = Join-Path $localDir $path
-                                if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
-                                Invoke-WebRequest -Uri $file.url -OutFile (Join-Path $targetDir $file.display_name) -UseBasicParsing -TimeoutSec 600
-                            }
-                            $zipPath = Join-Path $TempDir "files-$courseId-$([Guid]::NewGuid()).zip"
-                            Compress-Archive -Path "$localDir\*" -DestinationPath $zipPath -CompressionLevel Fastest
-                            Publish-FileToS3 -LocalPath $zipPath -Key $c.DailyFiles
-                            Invoke-TieredPromotion -BaseKey "$($c.BaseKey)-files" -Ext '.zip'
-                            if (Test-Path $localDir) { Remove-Item $localDir -Recurse -Force -ErrorAction SilentlyContinue }
-                            if (Test-Path $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
-                            $output += [pscustomobject]@{ CourseId = $courseId; Action = 'written'; Items = $files.Count }
-                        } else { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'skipped' } }
-                    } catch { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'failed'; Error = $_.Exception.Message } }
-                }
-
-                elseif ($TaskType -eq 'Gradebook') {
+                if ($TaskType -eq 'Gradebook') {
                     if ($WhatIfMode) { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'dryrun' }; continue }
                     try {
                         $assignments = @(Invoke-CanvasGet "/courses/$courseId/assignments")
@@ -1442,9 +1505,133 @@ function Main {
                         } else { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'skipped' } }
                     } catch { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'failed'; Error = $_.Exception.Message } }
                 }
+
+                elseif ($TaskType -eq 'Pages') {
+                    if ($WhatIfMode) { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'dryrun' }; continue }
+                    try {
+                        $pages = @(Invoke-CanvasGet "/courses/$courseId/pages" @{ 'include[]' = 'body' })
+                        if ($pages.Count -gt 0) {
+                            $jsonText = $pages | ConvertTo-Json -Depth 10 -Compress
+                            Publish-TextToS3 -Text $jsonText -Key $c.DailyPages
+                            Invoke-TieredPromotion -BaseKey "$($c.BaseKey)-pages" -Ext '.json'
+                            $output += [pscustomobject]@{ CourseId = $courseId; Action = 'written'; Items = $pages.Count }
+                        } else { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'skipped' } }
+                    } catch { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'failed'; Error = $_.Exception.Message } }
+                }
+                
+                elseif ($TaskType -eq 'Files') {
+                    if ($WhatIfMode) { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'dryrun' }; continue }
+                    try {
+                        $folders = @(Invoke-CanvasGet "/courses/$courseId/folders")
+                        $files = @(Invoke-CanvasGet "/courses/$courseId/files" @{ 'per_page' = '500' })
+                        
+                        if ($files.Count -gt 0) {
+                            $totalCourseSize = 0
+                            foreach ($f in $files) { $totalCourseSize += [long]$f.size }
+                            $eightyGB = 80GB
+                            $fiftyGB = 50GB
+                            $maxBlockSize = if ($totalCourseSize -gt $eightyGB) { $fiftyGB } else { $totalCourseSize + 1GB }
+
+                            $folderMap = @{}; foreach ($f in $folders) { $folderMap["$($f.id)"] = $f.full_name }
+
+                            $currentBlock = @()
+                            $currentBlockSize = 0
+                            $blockNumber = 1
+                            $totalItemsProcessed = 0
+
+                            function Process-FileBlock {
+                                param($BlockFiles, $BNum)
+                                if ($BlockFiles.Count -eq 0) { return }
+                                
+                                # Safeguard: Block jobs if global cache exceeds 100GB
+                                $maxCacheBytes = 100GB
+                                while ($true) {
+                                    $currentCacheBytes = 0
+                                    if (Test-Path $TempDir) {
+                                        $currentCacheBytes = (Get-ChildItem $TempDir -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+                                    }
+                                    if ($null -eq $currentCacheBytes) { $currentCacheBytes = 0 }
+                                    if ($currentCacheBytes -lt $maxCacheBytes) { break }
+                                    Start-Sleep -Seconds 10
+                                }
+
+                                $localDir = Join-Path $TempDir "files-$courseId-$([Guid]::NewGuid())"
+                                New-Item -ItemType Directory -Path $localDir -Force | Out-Null
+                                
+                                foreach ($bf in $BlockFiles) {
+                                    if (-not $bf.url) { continue }
+                                    $fId = "$($bf.folder_id)"
+                                    $path = if ($folderMap.ContainsKey($fId)) { $folderMap[$fId] } else { "" }
+                                    $path = $path -replace '(?i)^course files[/\\]?', ''
+
+                                    $targetDir = Join-Path $localDir $path
+                                    if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+                                    Invoke-WebRequest -Uri $bf.url -OutFile (Join-Path $targetDir $bf.display_name) -UseBasicParsing -TimeoutSec 600
+                                }
+
+                                $zipPath = Join-Path $TempDir "files-$courseId-part$BNum-$([Guid]::NewGuid()).zip"
+                                Compress-Archive -Path "$localDir\*" -DestinationPath $zipPath -CompressionLevel Fastest
+
+                                $blockKey = if ($totalCourseSize -gt $eightyGB) { $c.DailyFiles -replace '\.zip$', "-part$BNum.zip" } else { $c.DailyFiles }
+                                $blockExt = if ($totalCourseSize -gt $eightyGB) { "-part$BNum.zip" } else { ".zip" }
+
+                                Publish-FileToS3 -LocalPath $zipPath -Key $blockKey
+                                Invoke-TieredPromotion -BaseKey "$($c.BaseKey)-files" -Ext $blockExt
+
+                                if (Test-Path $localDir) { Remove-Item $localDir -Recurse -Force -ErrorAction SilentlyContinue }
+                                if (Test-Path $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
+                            }
+
+                            foreach ($file in $files) {
+                                $fSize = [long]$file.size
+                                if (($currentBlockSize + $fSize) -gt $maxBlockSize -and $currentBlock.Count -gt 0) {
+                                    Process-FileBlock -BlockFiles $currentBlock -BNum $blockNumber
+                                    $totalItemsProcessed += $currentBlock.Count
+                                    $currentBlock = @()
+                                    $currentBlockSize = 0
+                                    $blockNumber++
+                                }
+                                $currentBlock += $file
+                                $currentBlockSize += $fSize
+                            }
+
+                            if ($currentBlock.Count -gt 0) {
+                                Process-FileBlock -BlockFiles $currentBlock -BNum $blockNumber
+                                $totalItemsProcessed += $currentBlock.Count
+                            }
+
+                            $output += [pscustomobject]@{ CourseId = $courseId; Action = 'written'; Items = $totalItemsProcessed }
+                        } else { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'skipped' } }
+                    } catch { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'failed'; Error = $_.Exception.Message } }
+                }
             }
             return $output
         }
+
+        # ------------------------------------------------------------
+        # Gradebook export pass (Parallelized)
+        # ------------------------------------------------------------
+        $gradebookResults = @()
+        if ($SkipGradebooks) { Write-Warn "Skipping Gradebook export pass" }
+        else {
+            Write-Info "=== Backing up Gradebooks ($ConcurrentJobs Parallel Jobs) ==="
+            $gradesToExport = @()
+            foreach ($c in $exportList) {
+                if (-not $Force -and $s3Cache.ContainsKey($c.DailyGrades)) { $gradebookResults += [pscustomobject]@{ CourseId = $c.CourseId; Action = 'skipped' } }
+                else { $gradesToExport += $c }
+            }
+            
+            $sliceSize = if ($gradesToExport.Count -gt 0) { [math]::Ceiling($gradesToExport.Count / $ConcurrentJobs) } else { 1 }
+            $jobChunks = @()
+            for ($i = 0; $i -lt $gradesToExport.Count; $i += $sliceSize) { $jobChunks += ,@($gradesToExport[$i..[math]::Min($i+$sliceSize-1, $gradesToExport.Count - 1)]) }
+
+            foreach ($chunk in $jobChunks) {
+                $argsHash = @{ TaskType = 'Gradebook'; Chunk = $chunk; CanvasApiToken = $CanvasApiToken; CanvasBaseUrl = $CanvasBaseUrl; S3Bucket = $S3Bucket; AwsRegion = $AwsRegion; TempDir = $TempDir; Force = $Force; WhatIfMode = $WhatIfMode; TodayString = $todayString }
+                Start-Job -Name "GradebookJob" -ScriptBlock $DataWorkerJobBlock -ArgumentList $argsHash | Out-Null
+            }
+            Get-Job -Name "GradebookJob" | Wait-Job | ForEach-Object { $gradebookResults += Receive-Job -Job $_; Remove-Job -Job $_ }
+        }
+        $gW = @($gradebookResults | Where-Object { $_ -and $_.PSObject.Properties.Name -contains 'Action' -and $_.Action -eq 'written' }).Count
 
         # ------------------------------------------------------------
         # Pages export pass (Parallelized)
@@ -1452,14 +1639,14 @@ function Main {
         $pagesResults = @()
         if ($SkipPages) { Write-Warn "Skipping Pages export pass" }
         else {
-            Write-Info "=== Backing up Pages (3 Parallel Jobs) ==="
+            Write-Info "=== Backing up Pages ($ConcurrentJobs Parallel Jobs) ==="
             $pagesToExport = @()
             foreach ($c in $exportList) {
                 if (-not $Force -and $s3Cache.ContainsKey($c.DailyPages)) { $pagesResults += [pscustomobject]@{ CourseId = $c.CourseId; Action = 'skipped' } }
                 else { $pagesToExport += $c }
             }
             
-            $sliceSize = if ($pagesToExport.Count -gt 0) { [math]::Ceiling($pagesToExport.Count / 3) } else { 1 }
+            $sliceSize = if ($pagesToExport.Count -gt 0) { [math]::Ceiling($pagesToExport.Count / $ConcurrentJobs) } else { 1 }
             $jobChunks = @()
             for ($i = 0; $i -lt $pagesToExport.Count; $i += $sliceSize) { $jobChunks += ,@($pagesToExport[$i..[math]::Min($i+$sliceSize-1, $pagesToExport.Count - 1)]) }
 
@@ -1477,14 +1664,14 @@ function Main {
         $filesResults = @()
         if ($SkipFiles) { Write-Warn "Skipping Files export pass" }
         else {
-            Write-Info "=== Backing up Files (3 Parallel Jobs) ==="
+            Write-Info "=== Backing up Files ($ConcurrentJobs Parallel Jobs) ==="
             $filesToExport = @()
             foreach ($c in $exportList) {
                 if (-not $Force -and $s3Cache.ContainsKey($c.DailyFiles)) { $filesResults += [pscustomobject]@{ CourseId = $c.CourseId; Action = 'skipped' } }
                 else { $filesToExport += $c }
             }
             
-            $sliceSize = if ($filesToExport.Count -gt 0) { [math]::Ceiling($filesToExport.Count / 3) } else { 1 }
+            $sliceSize = if ($filesToExport.Count -gt 0) { [math]::Ceiling($filesToExport.Count / $ConcurrentJobs) } else { 1 }
             $jobChunks = @()
             for ($i = 0; $i -lt $filesToExport.Count; $i += $sliceSize) { $jobChunks += ,@($filesToExport[$i..[math]::Min($i+$sliceSize-1, $filesToExport.Count - 1)]) }
 
@@ -1495,31 +1682,6 @@ function Main {
             Get-Job -Name "FilesJob" | Wait-Job | ForEach-Object { $filesResults += Receive-Job -Job $_; Remove-Job -Job $_ }
         }
         $fW = @($filesResults | Where-Object { $_ -and $_.PSObject.Properties.Name -contains 'Action' -and $_.Action -eq 'written' }).Count
-
-        # ------------------------------------------------------------
-        # Gradebook export pass (Parallelized)
-        # ------------------------------------------------------------
-        $gradebookResults = @()
-        if ($SkipGradebooks) { Write-Warn "Skipping Gradebook export pass" }
-        else {
-            Write-Info "=== Backing up Gradebooks (3 Parallel Jobs) ==="
-            $gradesToExport = @()
-            foreach ($c in $exportList) {
-                if (-not $Force -and $s3Cache.ContainsKey($c.DailyGrades)) { $gradebookResults += [pscustomobject]@{ CourseId = $c.CourseId; Action = 'skipped' } }
-                else { $gradesToExport += $c }
-            }
-            
-            $sliceSize = if ($gradesToExport.Count -gt 0) { [math]::Ceiling($gradesToExport.Count / 3) } else { 1 }
-            $jobChunks = @()
-            for ($i = 0; $i -lt $gradesToExport.Count; $i += $sliceSize) { $jobChunks += ,@($gradesToExport[$i..[math]::Min($i+$sliceSize-1, $gradesToExport.Count - 1)]) }
-
-            foreach ($chunk in $jobChunks) {
-                $argsHash = @{ TaskType = 'Gradebook'; Chunk = $chunk; CanvasApiToken = $CanvasApiToken; CanvasBaseUrl = $CanvasBaseUrl; S3Bucket = $S3Bucket; AwsRegion = $AwsRegion; TempDir = $TempDir; Force = $Force; WhatIfMode = $WhatIfMode; TodayString = $todayString }
-                Start-Job -Name "GradebookJob" -ScriptBlock $DataWorkerJobBlock -ArgumentList $argsHash | Out-Null
-            }
-            Get-Job -Name "GradebookJob" | Wait-Job | ForEach-Object { $gradebookResults += Receive-Job -Job $_; Remove-Job -Job $_ }
-        }
-        $gW = @($gradebookResults | Where-Object { $_ -and $_.PSObject.Properties.Name -contains 'Action' -and $_.Action -eq 'written' }).Count
 
         # ------------------------------------------------------------
         # Sub-Account Pass
@@ -1547,9 +1709,9 @@ function Main {
         Write-Info '=== SUMMARY ==='
         Write-Info "Duration : $([int]$duration.TotalMinutes) min $($duration.Seconds) sec"
         Write-Info "Content (.imscc)  : $cW written"
+        Write-Info "Gradebook (.csv)  : $gW written"
         Write-Info "Pages (.json)     : $pW written"
         Write-Info "Files (.zip)      : $fW written"
-        Write-Info "Gradebook (.csv)  : $gW written"
         Write-Info "coverage_percent=$($coverage.CoveragePercent)  canvas_courses=$($coverage.CanvasCourses)  s3_courses=$($coverage.S3Courses)"
 
         if ($WhatIfMode) { $runStatus = 'DRYRUN'; Write-Warn 'BACKUP DRY RUN COMPLETE' }
@@ -1570,9 +1732,9 @@ function Main {
             "end_time=$($endTime.ToString('s'))"
             "duration_minutes=$([int]$duration.TotalMinutes)"
             "content_written=$cW"
+            "gradebook_written=$gW"
             "pages_written=$pW"
             "files_written=$fW"
-            "gradebook_written=$gW"
             "coverage_percent=$(if ($coverage) { $coverage.CoveragePercent } else { '' })"
             "canvas_courses=$(if ($coverage) { $coverage.CanvasCourses } else { '' })"
             "s3_courses=$(if ($coverage) { $coverage.S3Courses } else { '' })"
