@@ -18,7 +18,7 @@ A robust, self-contained PowerShell script to automate nightly backups of Canvas
 
 ## 📋 Prerequisites
 
-1. **Windows Environment:** PowerShell 5.1+ (native to Windows Server / Windows 10+). Likely min specs depending on Canvas size: 16 cores, 64gb ram, 1gbps, 150gb free disk. 
+1. **Windows Environment:** PowerShell 5.1+ (native to Windows Server / Windows 10+). Likely minimum specs depending on Canvas size: 16 cores, 64gb ram, 1gbps, 150gb free disk. 
 2. **AWS CLI v2:** Installed and configured in the system PATH.
 3. **Canvas API Token:** A Canvas access token with sufficient admin read/export capabilities.
 4. **S3 Bucket:** An S3 bucket with appropriate IAM permissions (write/delete/list) and server-side encryption enabled (recommended for FERPA compliance).
