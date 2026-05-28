@@ -195,6 +195,22 @@ function Write-Fail   ([string]$msg) { Write-Host "[FAIL ] $msg"  -ForegroundCol
 function Write-DryRun ([string]$msg) { Write-Host "[DRYRUN] $msg" -ForegroundColor Magenta }
 
 # ============================================================
+# Persistent Temp Cleanup Helper (Solves Antivirus File Locking)
+# ============================================================
+function Remove-TempPath {
+    param([string]$Path, [switch]$Recurse)
+    if (-not (Test-Path $Path)) { return }
+    Start-Sleep -Seconds 1 
+    $delRetries = 90
+    while ((Test-Path $Path) -and $delRetries -gt 0) {
+        if ($Recurse) { Remove-Item $Path -Recurse -Force -ErrorAction SilentlyContinue }
+        else { Remove-Item $Path -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $Path) { Start-Sleep -Seconds 2; $delRetries-- }
+    }
+    if (Test-Path $Path) { Write-Warn "Could not delete local path after 3 minutes! File severely locked: $Path" }
+}
+
+# ============================================================
 # Canvas API helpers
 # ============================================================
 function Get-JsonValue {
@@ -398,7 +414,7 @@ function Publish-TextToS3 {
         Publish-FileToS3 -LocalPath $tmpFile -Key $Key -StorageClass 'STANDARD'
     }
     finally {
-        if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue }
+        Remove-TempPath -Path $tmpFile
     }
 }
 
@@ -649,7 +665,7 @@ function Backup-CourseContent {
         Write-Fail "[$courseId] Upload/download error: $_"
         [pscustomobject]@{ CourseId = $courseId; Action = 'failed'; Error = "$_" }
     } finally {
-        if (Test-Path $tempFile) { Remove-Item $tempFile -Force -ErrorAction SilentlyContinue }
+        Remove-TempPath -Path $tempFile
     }
 }
 
@@ -718,9 +734,11 @@ function Backup-CourseFiles {
 
         $totalCourseSize = 0
         foreach ($f in $files) { $totalCourseSize += [long]$f.size }
-        $eightyGB = 80GB
-        $fiftyGB = 50GB
-        $maxBlockSize = if ($totalCourseSize -gt $eightyGB) { $fiftyGB } else { $totalCourseSize + 1GB }
+        
+        # Bin Packing limits. Adjust if you have less RAM or HDD space
+        $SplitThreshold = 80GB
+        $MaxChunkSize = 50GB
+        $maxBlockSize = if ($totalCourseSize -gt $SplitThreshold) { $MaxChunkSize } else { $totalCourseSize + 1GB }
 
         $folderMap = @{}
         foreach ($f in $folders) { $folderMap["$($f.id)"] = $f.full_name }
@@ -734,7 +752,7 @@ function Backup-CourseFiles {
             param($BlockFiles, $BNum)
             if ($BlockFiles.Count -eq 0) { return }
 
-            # Safegaurd to block any jobs from proceeding if global cached disk space is > 100GB
+            # Safeguard to block jobs from proceeding if global cached disk space is > 100GB
             $maxCacheBytes = 100GB
             while ($true) {
                 $currentCacheBytes = 0
@@ -761,18 +779,18 @@ function Backup-CourseFiles {
             }
 
             $zipPath = Join-Path $TempDir "files-$courseId-part$BNum-$([Guid]::NewGuid()).zip"
-            if ($totalCourseSize -gt $eightyGB) { Write-Info "[$courseId] Zipping part $BNum..." } else { Write-Info "[$courseId] Zipping files..." }
+            if ($totalCourseSize -gt $SplitThreshold) { Write-Info "[$courseId] Zipping part $BNum..." } else { Write-Info "[$courseId] Zipping files..." }
             
             Compress-Archive -Path "$localDir\*" -DestinationPath $zipPath -CompressionLevel Fastest
 
-            $blockKey = if ($totalCourseSize -gt $eightyGB) { $dailyKey -replace '\.zip$', "-part$BNum.zip" } else { $dailyKey }
-            $blockExt = if ($totalCourseSize -gt $eightyGB) { "-part$BNum.zip" } else { ".zip" }
+            $blockKey = if ($totalCourseSize -gt $SplitThreshold) { $dailyKey -replace '\.zip$', "-part$BNum.zip" } else { $dailyKey }
+            $blockExt = if ($totalCourseSize -gt $SplitThreshold) { "-part$BNum.zip" } else { ".zip" }
 
             Publish-FileToS3 -LocalPath $zipPath -Key $blockKey
             Invoke-TieredPromotion -BaseKey $filesBaseKey -Today (Get-Date -Format 'yyyy-MM-dd') -Ext $blockExt
 
-            if (Test-Path $localDir) { Remove-Item $localDir -Recurse -Force -ErrorAction SilentlyContinue }
-            if (Test-Path $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
+            Remove-TempPath -Path $localDir -Recurse
+            Remove-TempPath -Path $zipPath
         }
 
         foreach ($file in $files) {
@@ -912,7 +930,7 @@ function Backup-CourseGradebook {
         [pscustomobject]@{ CourseId = $courseId; Action = 'failed'; Error = "$_" }
     }
     finally {
-        if (Test-Path $tmpCsv) { Remove-Item $tmpCsv -Force -ErrorAction SilentlyContinue }
+        Remove-TempPath -Path $tmpCsv
     }
 }
 
@@ -1038,7 +1056,12 @@ function Main {
     if (-not $S3Bucket) { throw "S3_BUCKET is required" }
 
     if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
-    if (-not (Test-Path $TempDir)) { New-Item -ItemType Directory -Path $TempDir -Force | Out-Null }
+    if (-not (Test-Path $TempDir)) { 
+        New-Item -ItemType Directory -Path $TempDir -Force | Out-Null 
+    } else {
+        # Auto-clean orphaned files from previous failed runs to prevent immediate deadlocks
+        Remove-Item -Path "$TempDir\*" -Recurse -Force -ErrorAction SilentlyContinue
+    }
 
     try {
         Start-Transcript -Path $transcriptPath | Out-Null
@@ -1178,6 +1201,19 @@ function Main {
                 $PollTimeoutMins = $ArgsHash.PollTimeoutMins
                 $PollIntervalSecs = $ArgsHash.PollIntervalSecs
                 $todayString = $ArgsHash.TodayString
+
+                function Remove-TempPath {
+                    param([string]$Path, [switch]$Recurse)
+                    if (-not (Test-Path $Path)) { return }
+                    Start-Sleep -Seconds 1 
+                    $delRetries = 90
+                    while ((Test-Path $Path) -and $delRetries -gt 0) {
+                        if ($Recurse) { Remove-Item $Path -Recurse -Force -ErrorAction SilentlyContinue }
+                        else { Remove-Item $Path -Force -ErrorAction SilentlyContinue }
+                        if (Test-Path $Path) { Start-Sleep -Seconds 2; $delRetries-- }
+                    }
+                    if (Test-Path $Path) { Write-Warn "Could not delete local path after 3 minutes! File severely locked: $Path" }
+                }
 
                 function Get-JsonValue {
                     param($Obj, [string]$Property)
@@ -1349,7 +1385,9 @@ function Main {
                                 
                                 Write-Output [pscustomobject]@{ CourseId = $courseId; Action = 'written'; SizeBytes = $sizeBytes }
                             } catch { Write-Output [pscustomobject]@{ CourseId = $courseId; Action = 'failed'; Error = $_.Exception.Message }
-                            } finally { if (Test-Path $tempFile) { Remove-Item $tempFile -Force -ErrorAction SilentlyContinue } }
+                            } finally { 
+                                Remove-TempPath -Path $tempFile 
+                            }
                         } else {
                             $stillActive += $job
                         }
@@ -1448,6 +1486,7 @@ function Main {
             $TodayString = $ArgsHash.TodayString
 
             # --- INJECTED HELPER FUNCTIONS ---
+            function Remove-TempPath { param([string]$Path, [switch]$Recurse) if (-not (Test-Path $Path)) { return }; Start-Sleep -Seconds 1; $delRetries = 90; while ((Test-Path $Path) -and $delRetries -gt 0) { if ($Recurse) { Remove-Item $Path -Recurse -Force -ErrorAction SilentlyContinue } else { Remove-Item $Path -Force -ErrorAction SilentlyContinue }; if (Test-Path $Path) { Start-Sleep -Seconds 2; $delRetries-- } }; if (Test-Path $Path) { Write-Warn "Could not delete local path after 3 minutes! File severely locked: $Path" } }
             function Get-JsonValue { param($Obj, [string]$Property) if ($null -eq $Obj) { return $null }; if ($Obj -is [hashtable]) { return $Obj[$Property] }; if ($Obj.PSObject.Properties.Match($Property).Count -gt 0) { return $Obj.$Property }; return $null }
             function Invoke-CanvasApiPage { param([string]$Url) $attempt = 0; while ($true) { $attempt++; try { return Invoke-WebRequest -Uri $Url -Method Get -Headers @{ Authorization = "Bearer $CanvasApiToken" } -UseBasicParsing -TimeoutSec 60 } catch [System.Net.WebException] { $response = $_.Exception.Response; if ($response -and $response.StatusCode -eq 429) { $ra = 10; if ($response.Headers['Retry-After']) { try { $ra = [int]$response.Headers['Retry-After'] } catch {} }; Start-Sleep -Seconds $ra } elseif ($attempt -lt 3) { Start-Sleep -Seconds (5 * $attempt) } else { throw } } } }
             function Invoke-CanvasGet { param([string]$Endpoint, [hashtable]$Query = @{}) $base = $CanvasBaseUrl.TrimEnd('/'); $qs = @(); $hasPerPage = $false; foreach ($kv in $Query.GetEnumerator()) { if ($kv.Key -eq 'per_page') { $hasPerPage = $true }; $qs += "$([Uri]::EscapeDataString($kv.Key))=$([Uri]::EscapeDataString([string]$kv.Value))" }; if (-not $hasPerPage) { $qs += 'per_page=100' }; $url = "$base/api/v1${Endpoint}?" + ($qs -join '&'); $results = @(); do { $resp = Invoke-CanvasApiPage -Url $url; $page = $resp.Content | ConvertFrom-Json; if ($null -ne $page) { $results += @($page) }; $url = $null; $linkHeader = $resp.Headers['Link']
@@ -1465,7 +1504,7 @@ function Main {
                 if (-not $success) { throw "aws s3 cp failed" }
             }
             
-            function Publish-TextToS3 { param([string]$Text, [string]$Key) $tmpFile = Join-Path $TempDir "s3-text-$([Guid]::NewGuid()).txt"; try { [System.IO.File]::WriteAllText($tmpFile, $Text, [System.Text.Encoding]::UTF8); Publish-FileToS3 -LocalPath $tmpFile -Key $Key -StorageClass 'STANDARD' } finally { if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue } } }
+            function Publish-TextToS3 { param([string]$Text, [string]$Key) $tmpFile = Join-Path $TempDir "s3-text-$([Guid]::NewGuid()).txt"; try { [System.IO.File]::WriteAllText($tmpFile, $Text, [System.Text.Encoding]::UTF8); Publish-FileToS3 -LocalPath $tmpFile -Key $Key -StorageClass 'STANDARD' } finally { Remove-TempPath -Path $tmpFile } }
             function Invoke-S3CopyObject { param([string]$SourceKey, [string]$DestKey) if ($WhatIfMode) { return }; & aws s3 cp "s3://$S3Bucket/$SourceKey" "s3://$S3Bucket/$DestKey" --metadata-directive COPY --storage-class GLACIER_IR --region $AwsRegion --no-progress; if ($LASTEXITCODE -ne 0) { throw "aws s3 copy failed" } }
             function Get-S3ObjectsUnderPrefix { param([string]$Prefix) $results = @(); $token = $null; $oldEAP = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; do { $awsArgs = @('s3api', 'list-objects-v2', '--bucket', $S3Bucket, '--prefix', $Prefix, '--output', 'json', '--region', $AwsRegion); if ($token) { $awsArgs += @('--continuation-token', $token) }; $json = & aws @awsArgs 2>$null; if ($LASTEXITCODE -ne 0 -or -not $json -or $json -eq 'null') { break }; $page = $json | ConvertFrom-Json; if ($null -eq $page) { break }; if (Get-JsonValue $page 'Contents') { $results += @($page.Contents | Select-Object Key, LastModified) }; $isTrunc = Get-JsonValue $page 'IsTruncated'; $nxtTok = Get-JsonValue $page 'NextContinuationToken'; if ($isTrunc -and $nxtTok) { $token = $page.NextContinuationToken } else { $token = $null } } while ($token); $ErrorActionPreference = $oldEAP; if (-not $results) { return @() }; return @($results | Sort-Object { [datetime]$_.LastModified } -Descending) }
             function Invoke-S3Prune { param([string]$Prefix, [int]$KeepCount, [string]$Ext) $objects = @(Get-S3ObjectsUnderPrefix -Prefix $Prefix | Where-Object { $_.Key.EndsWith($Ext) }); if ($objects.Count -le $KeepCount) { return }; $toDelete = @($objects | Select-Object -Skip $KeepCount); foreach ($obj in $toDelete) { if (-not $WhatIfMode) { & aws s3api delete-object --bucket $S3Bucket --key $obj.Key --region $AwsRegion | Out-Null } } }
@@ -1500,7 +1539,7 @@ function Main {
                             [System.IO.File]::WriteAllBytes($tmpCsv, ([System.Text.Encoding]::UTF8.GetPreamble() + [System.Text.Encoding]::UTF8.GetBytes($lines -join "`r`n")))
                             Publish-FileToS3 -LocalPath $tmpCsv -Key $c.DailyGrades
                             Invoke-TieredPromotion -BaseKey "$($c.BaseKey)-gradebook" -Ext '.csv'
-                            if (Test-Path $tmpCsv) { Remove-Item $tmpCsv -Force -ErrorAction SilentlyContinue }
+                            Remove-TempPath -Path $tmpCsv
                             $output += [pscustomobject]@{ CourseId = $courseId; Action = 'written'; Items = $enrollments.Count }
                         } else { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'skipped' } }
                     } catch { $output += [pscustomobject]@{ CourseId = $courseId; Action = 'failed'; Error = $_.Exception.Message } }
@@ -1528,9 +1567,9 @@ function Main {
                         if ($files.Count -gt 0) {
                             $totalCourseSize = 0
                             foreach ($f in $files) { $totalCourseSize += [long]$f.size }
-                            $eightyGB = 80GB
-                            $fiftyGB = 50GB
-                            $maxBlockSize = if ($totalCourseSize -gt $eightyGB) { $fiftyGB } else { $totalCourseSize + 1GB }
+                            $SplitThreshold = 80GB
+                            $MaxChunkSize = 50GB
+                            $maxBlockSize = if ($totalCourseSize -gt $SplitThreshold) { $MaxChunkSize } else { $totalCourseSize + 1GB }
 
                             $folderMap = @{}; foreach ($f in $folders) { $folderMap["$($f.id)"] = $f.full_name }
 
@@ -1572,14 +1611,14 @@ function Main {
                                 $zipPath = Join-Path $TempDir "files-$courseId-part$BNum-$([Guid]::NewGuid()).zip"
                                 Compress-Archive -Path "$localDir\*" -DestinationPath $zipPath -CompressionLevel Fastest
 
-                                $blockKey = if ($totalCourseSize -gt $eightyGB) { $c.DailyFiles -replace '\.zip$', "-part$BNum.zip" } else { $c.DailyFiles }
-                                $blockExt = if ($totalCourseSize -gt $eightyGB) { "-part$BNum.zip" } else { ".zip" }
+                                $blockKey = if ($totalCourseSize -gt $SplitThreshold) { $c.DailyFiles -replace '\.zip$', "-part$BNum.zip" } else { $c.DailyFiles }
+                                $blockExt = if ($totalCourseSize -gt $SplitThreshold) { "-part$BNum.zip" } else { ".zip" }
 
                                 Publish-FileToS3 -LocalPath $zipPath -Key $blockKey
                                 Invoke-TieredPromotion -BaseKey "$($c.BaseKey)-files" -Ext $blockExt
 
-                                if (Test-Path $localDir) { Remove-Item $localDir -Recurse -Force -ErrorAction SilentlyContinue }
-                                if (Test-Path $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
+                                Remove-TempPath -Path $localDir -Recurse
+                                Remove-TempPath -Path $zipPath
                             }
 
                             foreach ($file in $files) {
