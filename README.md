@@ -71,6 +71,8 @@ Write-Host "Encrypted config written to $configPath"
 ### 5. Schedule via Windows Task Scheduler
 **Critical Requirement:** Because the `canvas-backup-config.clixml` file is encrypted using Windows DPAPI, the scheduled task **must** execute under the exact same Windows user account that generated the file in Step 4. If a different user (or the SYSTEM account) attempts to run the script, it will fail to decrypt the Canvas API token.
 
+You may find it helpful to breakup the jobs, run one frequently that gets the cartridges, grades and pages, and another less frequently that does the large files exports.
+
 Run the following in an elevated PowerShell prompt to register the nightly job. You will be prompted to enter the password for the executing user account:
 
 ```powershell
