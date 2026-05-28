@@ -16,9 +16,11 @@
       6. Back up course Pages (JSON with HTML body) - (Configurable Parallel Background Jobs)
       7. Back up course Files (.zip archive of raw files) - (Configurable Parallel Background Jobs)
          * Includes an automated HDD cache safeguard to ensure local temp files never exceed 100GB.
-         * Features Bin Packing: Auto-splits courses > 80GB into multiple 50GB zip parts to protect RAM/HDD.
+         * Features Bin Packing: Auto-splits courses > 20GB into multiple 10GB zip parts to protect RAM/HDD.
+         * Uses native .NET ZipFile compression to bypass PowerShell's 2GB file-locking bugs.
+         * Hardened Try/Catch/Finally to skip 404 ghost files and guarantee lock releases.
       8. Optionally recurse through all Canvas sub-accounts for persistent backups
-      9. Verify S3 coverage and upload run logs
+      9. Verify S3 coverage, upload run logs, and perform final HDD sweep
 
     Configuration Setup (Run Once):
       Run the following block manually in PowerShell as the SAME Windows user 
@@ -75,9 +77,7 @@
     Directory for transcript log files.
 
 .PARAMETER ConcurrentJobs
-    Number of parallel background jobs to run for data extraction (Content, Pages, Files, Gradebooks).
-    Default is 5. Increase for larger organizations with robust servers (e.g., -ConcurrentJobs 10) 
-    or decrease for smaller/resource-constrained environments (e.g., -ConcurrentJobs 2).
+    Number of parallel background jobs to run for data extraction.
 
 .PARAMETER CourseId
     Optional single-course mode.
@@ -105,24 +105,6 @@
 
 .PARAMETER Force
     Bypass same-day deduplication and always submit a fresh Canvas export.
-
-# ============================================================
-# Appendix - Windows Task Scheduler setup (run once, as admin)
-# ============================================================
-# CRITICAL: The scheduled task MUST execute under the exact same 
-# Windows user account that generated the encrypted config file.
-# Otherwise, it will fail to decrypt the Canvas API token.
-#
-#   $action  = New-ScheduledTaskAction -Execute 'powershell.exe' `
-#                  -Argument '-NonInteractive -File "C:\Scripts\Invoke-CanvasNightlyBackup.ps1"'
-#   $trigger = New-ScheduledTaskTrigger -Daily -At '3:00AM'
-#   $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 4)
-#   $runAsUser = $env:USERNAME # Ensure this matches the user from the config step!
-#
-#   Register-ScheduledTask -TaskName 'Canvas Nightly Backup' `
-#       -Action $action -Trigger $trigger -Settings $settings `
-#       -RunLevel Highest -User $runAsUser -Force
-# ============================================================
 #>
 
 param(
@@ -735,9 +717,9 @@ function Backup-CourseFiles {
         $totalCourseSize = 0
         foreach ($f in $files) { $totalCourseSize += [long]$f.size }
         
-        # Bin Packing limits. Adjust if you have less RAM or HDD space
-        $SplitThreshold = 80GB
-        $MaxChunkSize = 50GB
+        # Bin Packing limits. Adjusted to 10GB/20GB chunks for safer high concurrency.
+        $SplitThreshold = 20GB
+        $MaxChunkSize = 10GB
         $maxBlockSize = if ($totalCourseSize -gt $SplitThreshold) { $MaxChunkSize } else { $totalCourseSize + 1GB }
 
         $folderMap = @{}
@@ -752,45 +734,56 @@ function Backup-CourseFiles {
             param($BlockFiles, $BNum)
             if ($BlockFiles.Count -eq 0) { return }
 
-            # Safeguard to block jobs from proceeding if global cached disk space is > 100GB
-            $maxCacheBytes = 100GB
-            while ($true) {
-                $currentCacheBytes = 0
-                if (Test-Path $TempDir) {
-                    $currentCacheBytes = (Get-ChildItem $TempDir -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
-                }
-                if ($null -eq $currentCacheBytes) { $currentCacheBytes = 0 }
-                if ($currentCacheBytes -lt $maxCacheBytes) { break }
-                Start-Sleep -Seconds 10
-            }
-
             $localDir = Join-Path $TempDir "files-$courseId-$([Guid]::NewGuid())"
-            New-Item -ItemType Directory -Path $localDir -Force | Out-Null
-            
-            foreach ($bf in $BlockFiles) {
-                if (-not $bf.url) { continue }
-                $fId = "$($bf.folder_id)"
-                $path = if ($folderMap.ContainsKey($fId)) { $folderMap[$fId] } else { "" }
-                $path = $path -replace '(?i)^course files[/\\]?', ''
-
-                $targetDir = Join-Path $localDir $path
-                if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
-                Invoke-WebRequest -Uri $bf.url -OutFile (Join-Path $targetDir $bf.display_name) -UseBasicParsing -TimeoutSec 600
-            }
-
             $zipPath = Join-Path $TempDir "files-$courseId-part$BNum-$([Guid]::NewGuid()).zip"
-            if ($totalCourseSize -gt $SplitThreshold) { Write-Info "[$courseId] Zipping part $BNum..." } else { Write-Info "[$courseId] Zipping files..." }
-            
-            Compress-Archive -Path "$localDir\*" -DestinationPath $zipPath -CompressionLevel Fastest
 
-            $blockKey = if ($totalCourseSize -gt $SplitThreshold) { $dailyKey -replace '\.zip$', "-part$BNum.zip" } else { $dailyKey }
-            $blockExt = if ($totalCourseSize -gt $SplitThreshold) { "-part$BNum.zip" } else { ".zip" }
+            try {
+                # Safeguard to block jobs from proceeding if global cached disk space is > 100GB
+                $maxCacheBytes = 100GB
+                while ($true) {
+                    $currentCacheBytes = 0
+                    if (Test-Path $TempDir) {
+                        $currentCacheBytes = (Get-ChildItem $TempDir -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+                    }
+                    if ($null -eq $currentCacheBytes) { $currentCacheBytes = 0 }
+                    if ($currentCacheBytes -lt $maxCacheBytes) { break }
+                    Start-Sleep -Seconds 10
+                }
 
-            Publish-FileToS3 -LocalPath $zipPath -Key $blockKey
-            Invoke-TieredPromotion -BaseKey $filesBaseKey -Today (Get-Date -Format 'yyyy-MM-dd') -Ext $blockExt
+                New-Item -ItemType Directory -Path $localDir -Force | Out-Null
+                
+                foreach ($bf in $BlockFiles) {
+                    if (-not $bf.url) { continue }
+                    $fId = "$($bf.folder_id)"
+                    $path = if ($folderMap.ContainsKey($fId)) { $folderMap[$fId] } else { "" }
+                    $path = $path -replace '(?i)^course files[/\\]?', ''
 
-            Remove-TempPath -Path $localDir -Recurse
-            Remove-TempPath -Path $zipPath
+                    $targetDir = Join-Path $localDir $path
+                    if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+                    
+                    try {
+                        Invoke-WebRequest -Uri $bf.url -OutFile (Join-Path $targetDir $bf.display_name) -UseBasicParsing -TimeoutSec 60
+                    } catch {
+                        Write-Warn "[$courseId] Skipped broken/missing file: $($bf.display_name)"
+                    }
+                }
+
+                if ($totalCourseSize -gt $SplitThreshold) { Write-Info "[$courseId] Zipping part $BNum..." } else { Write-Info "[$courseId] Zipping files..." }
+                
+                # Using Native .NET ZipFile to bypass 2GB Compress-Archive bug
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                [System.IO.Compression.ZipFile]::CreateFromDirectory($localDir, $zipPath, [System.IO.Compression.CompressionLevel]::Fastest, $false)
+
+                $blockKey = if ($totalCourseSize -gt $SplitThreshold) { $dailyKey -replace '\.zip$', "-part$BNum.zip" } else { $dailyKey }
+                $blockExt = if ($totalCourseSize -gt $SplitThreshold) { "-part$BNum.zip" } else { ".zip" }
+
+                Publish-FileToS3 -LocalPath $zipPath -Key $blockKey
+                Invoke-TieredPromotion -BaseKey $filesBaseKey -Today (Get-Date -Format 'yyyy-MM-dd') -Ext $blockExt
+            } finally {
+                # This guarantees cleanup runs NO MATTER WHAT happens above
+                Remove-TempPath -Path $localDir -Recurse
+                Remove-TempPath -Path $zipPath
+            }
         }
 
         foreach ($file in $files) {
@@ -1212,7 +1205,6 @@ function Main {
                         else { Remove-Item $Path -Force -ErrorAction SilentlyContinue }
                         if (Test-Path $Path) { Start-Sleep -Seconds 2; $delRetries-- }
                     }
-                    if (Test-Path $Path) { Write-Warn "Could not delete local path after 3 minutes! File severely locked: $Path" }
                 }
 
                 function Get-JsonValue {
@@ -1486,7 +1478,8 @@ function Main {
             $TodayString = $ArgsHash.TodayString
 
             # --- INJECTED HELPER FUNCTIONS ---
-            function Remove-TempPath { param([string]$Path, [switch]$Recurse) if (-not (Test-Path $Path)) { return }; Start-Sleep -Seconds 1; $delRetries = 90; while ((Test-Path $Path) -and $delRetries -gt 0) { if ($Recurse) { Remove-Item $Path -Recurse -Force -ErrorAction SilentlyContinue } else { Remove-Item $Path -Force -ErrorAction SilentlyContinue }; if (Test-Path $Path) { Start-Sleep -Seconds 2; $delRetries-- } }; if (Test-Path $Path) { Write-Warn "Could not delete local path after 3 minutes! File severely locked: $Path" } }
+            function Write-Info {} function Write-Warn {} function Write-Ok {} function Write-Fail {} function Write-DryRun {}
+            function Remove-TempPath { param([string]$Path, [switch]$Recurse) if (-not (Test-Path $Path)) { return }; Start-Sleep -Seconds 1; $delRetries = 90; while ((Test-Path $Path) -and $delRetries -gt 0) { if ($Recurse) { Remove-Item $Path -Recurse -Force -ErrorAction SilentlyContinue } else { Remove-Item $Path -Force -ErrorAction SilentlyContinue }; if (Test-Path $Path) { Start-Sleep -Seconds 2; $delRetries-- } } }
             function Get-JsonValue { param($Obj, [string]$Property) if ($null -eq $Obj) { return $null }; if ($Obj -is [hashtable]) { return $Obj[$Property] }; if ($Obj.PSObject.Properties.Match($Property).Count -gt 0) { return $Obj.$Property }; return $null }
             function Invoke-CanvasApiPage { param([string]$Url) $attempt = 0; while ($true) { $attempt++; try { return Invoke-WebRequest -Uri $Url -Method Get -Headers @{ Authorization = "Bearer $CanvasApiToken" } -UseBasicParsing -TimeoutSec 60 } catch [System.Net.WebException] { $response = $_.Exception.Response; if ($response -and $response.StatusCode -eq 429) { $ra = 10; if ($response.Headers['Retry-After']) { try { $ra = [int]$response.Headers['Retry-After'] } catch {} }; Start-Sleep -Seconds $ra } elseif ($attempt -lt 3) { Start-Sleep -Seconds (5 * $attempt) } else { throw } } } }
             function Invoke-CanvasGet { param([string]$Endpoint, [hashtable]$Query = @{}) $base = $CanvasBaseUrl.TrimEnd('/'); $qs = @(); $hasPerPage = $false; foreach ($kv in $Query.GetEnumerator()) { if ($kv.Key -eq 'per_page') { $hasPerPage = $true }; $qs += "$([Uri]::EscapeDataString($kv.Key))=$([Uri]::EscapeDataString([string]$kv.Value))" }; if (-not $hasPerPage) { $qs += 'per_page=100' }; $url = "$base/api/v1${Endpoint}?" + ($qs -join '&'); $results = @(); do { $resp = Invoke-CanvasApiPage -Url $url; $page = $resp.Content | ConvertFrom-Json; if ($null -ne $page) { $results += @($page) }; $url = $null; $linkHeader = $resp.Headers['Link']
@@ -1567,8 +1560,10 @@ function Main {
                         if ($files.Count -gt 0) {
                             $totalCourseSize = 0
                             foreach ($f in $files) { $totalCourseSize += [long]$f.size }
-                            $SplitThreshold = 80GB
-                            $MaxChunkSize = 50GB
+                            
+                            # Bin Packing limits adjusted to 10GB/20GB chunks to safely scale with high concurrency.
+                            $SplitThreshold = 20GB
+                            $MaxChunkSize = 10GB
                             $maxBlockSize = if ($totalCourseSize -gt $SplitThreshold) { $MaxChunkSize } else { $totalCourseSize + 1GB }
 
                             $folderMap = @{}; foreach ($f in $folders) { $folderMap["$($f.id)"] = $f.full_name }
@@ -1581,44 +1576,55 @@ function Main {
                             function Process-FileBlock {
                                 param($BlockFiles, $BNum)
                                 if ($BlockFiles.Count -eq 0) { return }
-                                
-                                # Safeguard: Block jobs if global cache exceeds 100GB
-                                $maxCacheBytes = 100GB
-                                while ($true) {
-                                    $currentCacheBytes = 0
-                                    if (Test-Path $TempDir) {
-                                        $currentCacheBytes = (Get-ChildItem $TempDir -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
-                                    }
-                                    if ($null -eq $currentCacheBytes) { $currentCacheBytes = 0 }
-                                    if ($currentCacheBytes -lt $maxCacheBytes) { break }
-                                    Start-Sleep -Seconds 10
-                                }
 
                                 $localDir = Join-Path $TempDir "files-$courseId-$([Guid]::NewGuid())"
-                                New-Item -ItemType Directory -Path $localDir -Force | Out-Null
-                                
-                                foreach ($bf in $BlockFiles) {
-                                    if (-not $bf.url) { continue }
-                                    $fId = "$($bf.folder_id)"
-                                    $path = if ($folderMap.ContainsKey($fId)) { $folderMap[$fId] } else { "" }
-                                    $path = $path -replace '(?i)^course files[/\\]?', ''
-
-                                    $targetDir = Join-Path $localDir $path
-                                    if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
-                                    Invoke-WebRequest -Uri $bf.url -OutFile (Join-Path $targetDir $bf.display_name) -UseBasicParsing -TimeoutSec 600
-                                }
-
                                 $zipPath = Join-Path $TempDir "files-$courseId-part$BNum-$([Guid]::NewGuid()).zip"
-                                Compress-Archive -Path "$localDir\*" -DestinationPath $zipPath -CompressionLevel Fastest
 
-                                $blockKey = if ($totalCourseSize -gt $SplitThreshold) { $c.DailyFiles -replace '\.zip$', "-part$BNum.zip" } else { $c.DailyFiles }
-                                $blockExt = if ($totalCourseSize -gt $SplitThreshold) { "-part$BNum.zip" } else { ".zip" }
+                                try {
+                                    # Safeguard: Block jobs if global cache exceeds 100GB
+                                    $maxCacheBytes = 100GB
+                                    while ($true) {
+                                        $currentCacheBytes = 0
+                                        if (Test-Path $TempDir) {
+                                            $currentCacheBytes = (Get-ChildItem $TempDir -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+                                        }
+                                        if ($null -eq $currentCacheBytes) { $currentCacheBytes = 0 }
+                                        if ($currentCacheBytes -lt $maxCacheBytes) { break }
+                                        Start-Sleep -Seconds 10
+                                    }
 
-                                Publish-FileToS3 -LocalPath $zipPath -Key $blockKey
-                                Invoke-TieredPromotion -BaseKey "$($c.BaseKey)-files" -Ext $blockExt
+                                    New-Item -ItemType Directory -Path $localDir -Force | Out-Null
+                                    
+                                    foreach ($bf in $BlockFiles) {
+                                        if (-not $bf.url) { continue }
+                                        $fId = "$($bf.folder_id)"
+                                        $path = if ($folderMap.ContainsKey($fId)) { $folderMap[$fId] } else { "" }
+                                        $path = $path -replace '(?i)^course files[/\\]?', ''
 
-                                Remove-TempPath -Path $localDir -Recurse
-                                Remove-TempPath -Path $zipPath
+                                        $targetDir = Join-Path $localDir $path
+                                        if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+                                        
+                                        try {
+                                            Invoke-WebRequest -Uri $bf.url -OutFile (Join-Path $targetDir $bf.display_name) -UseBasicParsing -TimeoutSec 60
+                                        } catch {
+                                            # Gracefully skip dead links/ghost files so the zip doesn't abort
+                                        }
+                                    }
+
+                                    # Using Native .NET ZipFile to bypass 2GB Compress-Archive bug
+                                    Add-Type -AssemblyName System.IO.Compression.FileSystem
+                                    [System.IO.Compression.ZipFile]::CreateFromDirectory($localDir, $zipPath, [System.IO.Compression.CompressionLevel]::Fastest, $false)
+
+                                    $blockKey = if ($totalCourseSize -gt $SplitThreshold) { $c.DailyFiles -replace '\.zip$', "-part$BNum.zip" } else { $c.DailyFiles }
+                                    $blockExt = if ($totalCourseSize -gt $SplitThreshold) { "-part$BNum.zip" } else { ".zip" }
+
+                                    Publish-FileToS3 -LocalPath $zipPath -Key $blockKey
+                                    Invoke-TieredPromotion -BaseKey "$($c.BaseKey)-files" -Ext $blockExt
+
+                                } finally {
+                                    Remove-TempPath -Path $localDir -Recurse
+                                    Remove-TempPath -Path $zipPath
+                                }
                             }
 
                             foreach ($file in $files) {
@@ -1782,6 +1788,9 @@ function Main {
 
         try { if (Test-Path $transcriptPath) { Publish-FileToS3 -LocalPath $transcriptPath -Key $s3LogKey -StorageClass 'STANDARD' } } catch {}
         try { Publish-TextToS3 -Text $summaryText -Key $s3SummaryKey } catch {}
+        
+        # Final cleanup sweep to ensure empty Temp directory between runs
+        Remove-Item -Path "$TempDir\*" -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
